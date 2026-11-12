@@ -109,8 +109,13 @@ Things to know:
   DNS server onto its tunnel adapter, where it is unreachable, and then every
   lookup waits for a timeout. Behind this router the client is redundant
   anyway; turn it off.
+- Leave the router UI on "Disable" while the bridge is in use. The other
+  modes start firmware helpers that work against it.
 - `ipv6-bridge.sh stop` removes the bridge and the rules and restores the
-  flow cache mode.
+  flow cache mode, but the service puts the bridge back within 15 s as long
+  as the script is executable. To turn it off for good, follow the stop with
+  `chmod -x /jffs/usque/ipv6-bridge.sh`, and only then pick another IPv6 mode
+  in the UI.
 
 ### Firmware "IPv6 Passthrough" with `ipv6-ra-filter.sh`
 
