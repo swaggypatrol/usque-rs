@@ -1,0 +1,15 @@
+#!/bin/sh
+# Asuswrt-Merlin runs this after it has carried out a service event
+# ($1 = start|stop|restart, $2 = what). See service-event.
+[ -x /jffs/usque/ipv6-bridge.sh ] || exit 0
+case "$2" in
+    wireless* | net* | lan* | allnet)
+        # The restart is over: rebuild the rules, then plug the WAN port back in.
+        /jffs/usque/ipv6-bridge.sh release >/dev/null 2>&1 &
+        ;;
+    *)
+        # Anything else: just check that nothing has gone missing.
+        /jffs/usque/ipv6-bridge.sh ensure >/dev/null 2>&1 &
+        ;;
+esac
+exit 0

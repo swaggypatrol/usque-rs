@@ -13,6 +13,7 @@
 # when using this script; it manages the router's own IPv6 on the bridge.
 #
 # usage: ipv6-bridge.sh start|stop|ensure|status
+#        ipv6-bridge.sh hold|release    (called by the service-event hooks)
 #
 # What is not bridged: anything that is not IPv6. ARP, DHCP and all other IPv4
 # traffic can never cross, in either direction.
@@ -29,48 +30,101 @@ DNS_INTERCEPT=1
 
 WAN=$(nvram get wan0_ifname 2>/dev/null); WAN=${WAN:-eth0}
 BR=$(nvram get lan_ifname 2>/dev/null); BR=${BR:-br0}
+BRMAC=$(cat "/sys/class/net/$BR/address" 2>/dev/null)
 # TCP ports of this router that the WAN side must not reach over IPv6.
 GUARD_TCP="22 53 80 443 8443"
+LOCK=/tmp/ipv6-bridge.lock
+# While this file is fresh the firmware is restarting something that wipes
+# ebtables, and the WAN port must stay out of the bridge.
+HOLD=/tmp/ipv6-bridge.hold
+HOLD_MAX=120
+
+held() {
+    [ -f "$HOLD" ] || return 1
+    [ $(($(date +%s) - $(cat "$HOLD" 2>/dev/null || echo 0))) -lt "$HOLD_MAX" ]
+}
 
 conf() { echo "$2" > "/proc/sys/net/ipv6/conf/$BR/$1" 2>/dev/null; }
 in_bridge() { [ -d "/sys/class/net/$BR/brif/$WAN" ]; }
-has_jump() { ebtables -t "$1" -L "$2" 2>/dev/null | grep -q -- "-j $3"; }
+has_jump() { ebtables -t "$1" -L "$2" 2>/dev/null | grep -qE -- "-j $3( |\$)"; }
+unplug() { in_bridge && brctl delif "$BR" "$WAN"; }
 
 chain() { # chain <table> <name>: create (or empty) a user chain that falls through
     ebtables -t "$1" -N "$2" -P RETURN 2>/dev/null || ebtables -t "$1" -F "$2"
 }
 
-build_rules() {
-    # Non-IPv6 frames arriving on the WAN port are routed, never bridged.
-    chain broute v6br
-    ebtables -t broute -A v6br -i "$WAN" -p ! IPv6 -j DROP
-
-    chain filter v6br_fw
-    ebtables -A v6br_fw -o "$WAN" -p ! IPv6 -j DROP
-    ebtables -A v6br_fw -i "$WAN" -p ! IPv6 -j DROP
-
-    chain filter v6br_out
-    ebtables -A v6br_out -o "$WAN" -p ! IPv6 -j DROP
-
-    chain filter v6br_in
-    ebtables -A v6br_in -i "$WAN" -p ! IPv6 -j DROP
-    for p in $GUARD_TCP; do
-        ebtables -A v6br_in -i "$WAN" -p IPv6 --ip6-proto tcp --ip6-dport "$p" -j DROP
-    done
-    ebtables -A v6br_in -i "$WAN" -p IPv6 --ip6-proto udp --ip6-dport 53 -j DROP
-
+# The guard that keeps everything but IPv6 from crossing. It sits in the nat
+# table, where one rule on the way in and one on the way out see every frame
+# that enters or leaves through the WAN port, forwarded or local.
+#
+# The firmware empties every ebtables table, this one included, whenever it
+# restarts the wireless interfaces or the network, and clients reconnect and
+# ask for DHCP at exactly that moment. So the WAN port is only ever in the
+# bridge while the guard is in place: the service-event hook unplugs it before
+# such a restart (`hold`), and it is plugged back in afterwards (`release`).
+build_nat() {
     chain nat v6br
+    # Non-IPv6 frames from the WAN port normally never get this far (see
+    # build_broute). When they do, they must not enter the bridge.
+    ebtables -t nat -A v6br -i "$WAN" -p ! IPv6 -j DROP
+    for p in $GUARD_TCP; do
+        ebtables -t nat -A v6br -i "$WAN" -d "$BRMAC" -p IPv6 --ip6-proto tcp --ip6-dport "$p" -j DROP
+    done
+    ebtables -t nat -A v6br -i "$WAN" -d "$BRMAC" -p IPv6 --ip6-proto udp --ip6-dport 53 -j DROP
     if [ "$DNS_INTERCEPT" = 1 ]; then
         # Hand LAN DNS-over-IPv6 frames to this router instead of bridging them on.
         ebtables -t nat -A v6br -i ! "$WAN" -p IPv6 --ip6-proto udp --ip6-dport 53 -j redirect --redirect-target ACCEPT
         ebtables -t nat -A v6br -i ! "$WAN" -p IPv6 --ip6-proto tcp --ip6-dport 53 -j redirect --redirect-target ACCEPT
     fi
+    chain nat v6br_post
+    # Nothing but IPv6 leaves through the WAN port, forwarded or from this router's bridge.
+    ebtables -t nat -A v6br_post -o "$WAN" -p ! IPv6 -j DROP
 
-    has_jump broute BROUTING v6br || ebtables -t broute -I BROUTING -j v6br
-    has_jump filter FORWARD v6br_fw || ebtables -I FORWARD -j v6br_fw
-    has_jump filter OUTPUT v6br_out || ebtables -I OUTPUT -j v6br_out
-    has_jump filter INPUT v6br_in || ebtables -I INPUT -j v6br_in
     has_jump nat PREROUTING v6br || ebtables -t nat -I PREROUTING -j v6br
+    has_jump nat POSTROUTING v6br_post || ebtables -t nat -I POSTROUTING -j v6br_post
+}
+
+# Non-IPv6 frames arriving on the WAN port are routed, never bridged: this is
+# what keeps the router's own IPv4 WAN working while the port is in the
+# bridge. Should this rule alone go missing, the guard above drops those
+# frames: IPv4 on the WAN pauses, but nothing leaks.
+build_broute() {
+    chain broute v6br
+    ebtables -t broute -A v6br -i "$WAN" -p ! IPv6 -j DROP
+    has_jump broute BROUTING v6br || ebtables -t broute -I BROUTING -j v6br
+}
+
+nat_ok() {
+    redirects=0
+    [ "$DNS_INTERCEPT" = 1 ] && redirects=2
+    has_jump nat PREROUTING v6br && has_jump nat POSTROUTING v6br_post &&
+        ebtables -t nat -L v6br 2>/dev/null | grep -q -- "-p ! IPv6 -i $WAN -j DROP" &&
+        ebtables -t nat -L v6br_post 2>/dev/null | grep -q -- "-p ! IPv6 -o $WAN -j DROP" &&
+        [ "$(ebtables -t nat -L v6br 2>/dev/null | grep -c redirect)" = "$redirects" ]
+}
+broute_ok() {
+    has_jump broute BROUTING v6br &&
+        ebtables -t broute -L v6br 2>/dev/null | grep -q -- "-p ! IPv6 -i $WAN -j DROP"
+}
+rules_ok() { nat_ok && broute_ok; }
+
+# Earlier versions kept the guard in the filter table.
+drop_legacy() {
+    ebtables -D FORWARD -j v6br_fw 2>/dev/null
+    ebtables -D OUTPUT -j v6br_out 2>/dev/null
+    ebtables -D INPUT -j v6br_in 2>/dev/null
+    for c in v6br_fw v6br_out v6br_in; do ebtables -X $c 2>/dev/null; done
+}
+
+# Put missing rules back. The WAN port is unplugged from the bridge before the
+# guard is touched, so there is never a moment with the port in and the guard out.
+ensure_rules() {
+    if ! nat_ok; then
+        unplug && logger -t ipv6-bridge "guard rules missing: WAN port taken out of the bridge"
+        build_nat
+    fi
+    broute_ok || build_broute
+    rules_ok
 }
 
 # Broadcom's flow cache, in its default "L2 & L3" mode, forwards frames between
@@ -84,13 +138,6 @@ flow_l3() {
     case "$(flow_mode)" in
         L2*) "$FC" config --accel-mode 0 >/dev/null 2>&1 && logger -t ipv6-bridge "flow cache set to L3 mode" ;;
     esac
-}
-
-rules_ok() {
-    has_jump broute BROUTING v6br && has_jump filter FORWARD v6br_fw &&
-        has_jump filter OUTPUT v6br_out && has_jump filter INPUT v6br_in &&
-        [ "$(ebtables -t broute -L v6br 2>/dev/null | grep -c IPv6)" -ge 1 ] &&
-        [ "$(ebtables -L v6br_fw 2>/dev/null | grep -c IPv6)" -ge 2 ]
 }
 
 ip6_rule() { ip6tables "$@" 2>/dev/null; }
@@ -132,8 +179,12 @@ solicit() { # restart autoconfiguration so a router solicitation goes out now
 have_v6() { ip -6 route show default dev "$BR" 2>/dev/null | grep -q default; }
 
 start() {
-    build_rules
-    rules_ok || { echo "ebtables rules are not in place; not bridging"; return 1; }
+    drop_legacy
+    if ! ensure_rules; then
+        unplug
+        echo "ebtables rules are not in place; not bridging"
+        return 1
+    fi
     flow_l3
     ip6_rules
     router_v6
@@ -150,8 +201,11 @@ start() {
 
 ensure() {
     if ! rules_ok || ! in_bridge; then
+        what=bridge
+        nat_ok || what="guard rules"
+        nat_ok && ! broute_ok && what="broute rule"
         start
-        logger -t ipv6-bridge "bridge or rules restored"
+        logger -t ipv6-bridge "$what restored"
         return
     fi
     flow_l3
@@ -162,15 +216,14 @@ ensure() {
 }
 
 stop() {
-    in_bridge && brctl delif "$BR" "$WAN"
+    unplug
     ebtables -t broute -D BROUTING -j v6br 2>/dev/null
-    ebtables -D FORWARD -j v6br_fw 2>/dev/null
-    ebtables -D OUTPUT -j v6br_out 2>/dev/null
-    ebtables -D INPUT -j v6br_in 2>/dev/null
-    ebtables -t nat -D PREROUTING -j v6br 2>/dev/null
     ebtables -t broute -X v6br 2>/dev/null
-    for c in v6br_fw v6br_out v6br_in; do ebtables -X $c 2>/dev/null; done
+    ebtables -t nat -D PREROUTING -j v6br 2>/dev/null
+    ebtables -t nat -D POSTROUTING -j v6br_post 2>/dev/null
     ebtables -t nat -X v6br 2>/dev/null
+    ebtables -t nat -X v6br_post 2>/dev/null
+    drop_legacy
     for proto in udp tcp; do
         while ip6_rule -t nat -D PREROUTING -i "$BR" -p $proto --dport 53 -j REDIRECT --to-ports 53; do :; done
     done
@@ -181,19 +234,53 @@ stop() {
 
 status() {
     if in_bridge; then echo "bridge:   $WAN is a port of $BR"; else echo "bridge:   $WAN is NOT in $BR"; fi
-    if rules_ok; then echo "filters:  in place (only IPv6 crosses)"; else echo "filters:  MISSING"; fi
+    held && echo "hold:     a firmware restart is in progress; the port stays out until it ends"
+    if nat_ok; then echo "guard:    in place (only IPv6 crosses)"; else echo "guard:    MISSING"; fi
+    if broute_ok; then echo "broute:   in place (IPv4 on the WAN port is routed)"; else echo "broute:   MISSING (IPv4 on the WAN port is paused)"; fi
+    echo "caught:   $(ebtables -t nat -L v6br --Lc 2>/dev/null | sed -n 's/.*-p ! IPv6 -i .* pcnt = \([0-9]*\) .*/\1/p' | head -1) non-IPv6 frames stopped by the guard while the broute rule was missing"
     echo "dns:      intercept=$DNS_INTERCEPT ($(ebtables -t nat -L v6br 2>/dev/null | grep -c redirect) redirect rules)"
-    echo "flows:    flow cache mode $(flow_mode) (must be L3 for the filters to see every connection)"
+    echo "flows:    flow cache mode $(flow_mode) (must be L3 for the rules to see every connection)"
     echo "router:   $(ip -6 addr show dev "$BR" scope global 2>/dev/null | awk '/inet6/{print $2}' | tr '\n' ' ')"
     echo "route:    $(ip -6 route show default 2>/dev/null | head -1)"
     echo "firmware: ipv6_service=$(nvram get ipv6_service 2>/dev/null)"
     echo "reach:    $(ping6 -c 2 -W 2 -q 2606:4700:4700::1111 2>&1 | tail -1)"
 }
 
+# One instance at a time: the service loop and the firmware hooks both call in.
+lock() {
+    i=0
+    while ! mkdir "$LOCK" 2>/dev/null; do
+        i=$((i + 1))
+        [ $i -gt 30 ] && rmdir "$LOCK" 2>/dev/null
+        sleep 1
+    done
+    trap 'rmdir "$LOCK" 2>/dev/null' EXIT
+}
+
 case "$1" in
-    start) start ;;
-    stop) stop ;;
-    ensure) ensure ;;
+    start)
+        lock
+        if held; then unplug; else start; fi
+        ;;
+    ensure)
+        lock
+        if held; then unplug; else ensure; fi
+        ;;
+    stop)
+        lock
+        rm -f "$HOLD"
+        stop
+        ;;
+    hold)
+        lock
+        date +%s > "$HOLD"
+        unplug && logger -t ipv6-bridge "WAN port unplugged while the firmware restarts ($2)"
+        ;;
+    release)
+        lock
+        rm -f "$HOLD"
+        ensure
+        ;;
     status) status ;;
     *) echo "usage: $0 start|stop|ensure|status"; exit 1 ;;
 esac

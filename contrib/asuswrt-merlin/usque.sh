@@ -2,8 +2,10 @@
 # usque-rs as a LAN-wide IPv4 exit on Asuswrt-Merlin (written for the RT-AX86U).
 #
 # All IPv4 traffic from the LAN is routed into the MASQUE tunnel; IPv6 and the
-# router's own traffic keep using the WAN directly. If the tunnel process is
-# not running, its route disappears and LAN traffic falls back to the WAN.
+# router's own traffic keep using the WAN directly. The LAN is only routed
+# into the tunnel while a probe through it is answered: right after boot, or
+# whenever the tunnel is down, LAN traffic uses the WAN directly instead of
+# disappearing into a dead tunnel.
 #
 # usage: usque.sh start|stop|restart|status|fw|rotate
 #
@@ -12,6 +14,7 @@
 #   config.json   created by `usque-rs register`
 #   env           optional overrides, one VAR=value per line, e.g.
 #                   ROUTE_LAN=0      keep the tunnel up but do not route the LAN into it
+#                   FALLBACK=0       keep the LAN routed into the tunnel even when it is down
 #                   USQUE_GRO=0      disable TCP segment merging on TUN writes
 #                   USQUE_PIN=off    disable thread pinning
 
@@ -30,8 +33,16 @@ CHILD=/var/run/usque.pid
 # the outer one. Cloudflare documents the same exclusion for its own WAN
 # on-ramps ("double encapsulation").
 WARP_INGRESS="162.159.192.0/24 162.159.193.0/24 162.159.197.0/24 162.159.198.0/24"
+# Addresses pinged through the tunnel to see whether it carries traffic, how
+# often (seconds), and how many checks in a row must fail, or succeed, before
+# the LAN is switched to the WAN, or back.
+PROBE="1.1.1.1 8.8.8.8"
+CHECK=5
+FAILS=2
+PASSES=2
 
 ROUTE_LAN=1
+FALLBACK=1
 RUST_LOG=info
 if [ -f "$DIR/env" ]; then
     set -a
@@ -92,12 +103,6 @@ fw_up() { have_if && fw_rules ipt_add ipt_ins; }
 fw_down() { fw_rules ipt_del ipt_del; }
 
 # --- routing -----------------------------------------------------------------
-rule_flush() {
-    for p in $((PRIO - 20)) $((PRIO - 10)) "$PRIO"; do
-        while ip rule del prio "$p" 2>/dev/null; do :; done
-    done
-}
-
 # Compare selectors, not just priority: another owned rule can survive a
 # partial firmware reset while the LAN rule or one exclusion is missing.
 rule_has() {
@@ -123,7 +128,13 @@ rule_ensure() {
     fi
 }
 
-route_up() {
+rule_del() { for p in "$@"; do while ip rule del prio "$p" 2>/dev/null; do :; done; done; }
+lan_routed() { ip rule list | grep -q "^$PRIO:"; }
+
+# The tunnel's own table, and a rule for connections bound to the tunnel
+# address (`curl --interface`, the probe below). Present whenever the
+# interface exists; on its own it moves no LAN traffic.
+route_base() {
     have_if || return 1
     ROUTE_CHANGED=0
     if ! ip route show table "$TABLE" 2>/dev/null | awk -v dev="$IF" '
@@ -135,23 +146,59 @@ route_up() {
     fi
     a=$(tun_ip)
     [ -z "$a" ] || rule_ensure $((PRIO - 20)) "$a" all "$TABLE" || return 1
+    [ "$ROUTE_CHANGED" != 1 ] || ip route flush cache
+
+}
+
+# Connections set up along the other path cannot continue on this one. Forget
+# them, in the kernel and in the hardware flow cache, so that they fail at
+# once and are opened again instead of hanging.
+flow_reset() {
+    conntrack -F >/dev/null 2>&1
+    fc flush >/dev/null 2>&1
+    ip route flush cache
+}
+
+# Send the LAN's IPv4 into the tunnel.
+lan_ensure() {
     net=$(lan_net)
-    if [ "$ROUTE_LAN" = 1 ] && [ -n "$net" ]; then
-        for d in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 100.64.0.0/10 224.0.0.0/4 $WARP_INGRESS; do
-            rule_ensure $((PRIO - 10)) "$net" "$d" main || return 1
-        done
-        rule_ensure "$PRIO" "$net" all "$TABLE" || return 1
-    fi
-    if [ "$ROUTE_CHANGED" = 1 ]; then
-        ip route flush cache
-        logger -t usque "routing rules restored"
-    fi
+    [ "$ROUTE_LAN" = 1 ] && [ -n "$net" ] || return 0
+    ROUTE_CHANGED=0
+    for d in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 100.64.0.0/10 224.0.0.0/4 $WARP_INGRESS; do
+        rule_ensure $((PRIO - 10)) "$net" "$d" main || return 1
+    done
+    rule_ensure "$PRIO" "$net" all "$TABLE" || return 1
+    [ "$ROUTE_CHANGED" != 1 ] || ip route flush cache
+}
+
+lan_on() {
+    rule_del $((PRIO - 10)) "$PRIO"
+    lan_ensure || return 1
+    flow_reset
+
+}
+
+# Let the LAN's IPv4 use the WAN directly.
+lan_off() {
+    rule_del $((PRIO - 10)) "$PRIO"
+    flow_reset
 }
 
 route_down() {
-    rule_flush
+    rule_del $((PRIO - 20)) $((PRIO - 10)) "$PRIO"
     ip route flush table "$TABLE" 2>/dev/null
     ip route flush cache
+}
+
+# True if a ping sent through the tunnel is answered. The ping also wakes the
+# tunnel up: usque-rs connects when the first packet arrives.
+tunnel_ok() {
+    a=$(tun_ip)
+    [ -n "$a" ] || return 1
+    for t in $PROBE; do
+        ping -c 1 -W 2 -I "$a" "$t" >/dev/null 2>&1 && return 0
+    done
+    return 1
 }
 
 # --- log ---------------------------------------------------------------------
@@ -167,13 +214,55 @@ rotate() {
 alive() { [ -f "$1" ] && kill -0 "$(cat "$1")" 2>/dev/null; }
 
 # Re-apply routing and firewall entries that have gone missing.
+# $1 is where the LAN should be going right now: on (tunnel) or off (WAN).
 ensure() {
-    # Optional companion: native IPv6 for the LAN by bridging it to the WAN.
+    # Preserve the supervisor's chosen fallback state.
     [ -x "$DIR/ipv6-bridge.sh" ] && "$DIR/ipv6-bridge.sh" ensure
     have_if || return 0
-    route_up
+    route_base
+    if [ "$1" = on ] && [ "$ROUTE_LAN" = 1 ]; then
+        lan_ensure
+    fi
     # Check every owned NAT, MSS and INPUT rule, even if NAT survived.
     fw_up
+
+}
+
+# Watch the tunnel while usque-rs runs, and point the LAN at it only while it
+# carries traffic.
+watch() {
+    lan=off
+    bad=0
+    good=0
+    # Start from a clean slate: no LAN rules until the tunnel has proved itself.
+    rule_del $((PRIO - 10)) "$PRIO"
+    [ "$FALLBACK" = 1 ] || { lan=on; lan_on; }
+    while alive "$CHILD"; do
+        if tunnel_ok; then
+            bad=0
+            good=$((good + 1))
+            if [ $lan = off ] && [ $good -ge "$PASSES" ]; then
+                lan=on
+                lan_on
+                logger -t usque "tunnel carries traffic: LAN IPv4 goes through it"
+            fi
+        else
+            good=0
+            bad=$((bad + 1))
+            if [ $lan = on ] && [ "$FALLBACK" = 1 ] && [ $bad -ge "$FAILS" ]; then
+                lan=off
+                lan_off
+                logger -t usque "tunnel carries no traffic: LAN IPv4 uses the WAN until it does"
+            fi
+        fi
+        # The firmware resets routing rules and firewall tables whenever the
+        # WAN comes up or the firewall is rebuilt; put ours back when missing.
+        ensure $lan
+        # (`sleep & wait` keeps the shell responsive to the stop signal and
+        # reaps usque-rs when it exits.)
+        sleep "$CHECK" &
+        wait $!
+    done
 }
 
 run() {
@@ -190,20 +279,12 @@ run() {
         while [ $i -lt 20 ] && ! have_if; do sleep 1; i=$((i + 1)); done
         if have_if; then
             fw_up
-            route_up
+            route_base
             logger -t usque "tunnel interface $IF is up"
         else
             logger -t usque "tunnel interface $IF did not appear"
         fi
-        # The firmware resets routing rules and firewall tables whenever the
-        # WAN comes up or the firewall is rebuilt; put ours back when missing.
-        # (`sleep & wait` keeps the shell responsive to the stop signal and
-        # reaps usque-rs when it exits.)
-        while alive "$CHILD"; do
-            sleep 15 &
-            wait $!
-            ensure
-        done
+        watch
         logger -t usque "usque-rs exited; restarting in 5 s"
         route_down
         sleep 5
@@ -241,6 +322,13 @@ status() {
     if alive "$CHILD"; then echo "usque-rs:   running (pid $(cat "$CHILD"))"; else echo "usque-rs:   not running"; fi
     if have_if; then
         echo "interface:  $IF $(tun_ip) mtu $(cat "/sys/class/net/$IF/mtu")"
+        if lan_routed; then
+            echo "lan:        IPv4 goes through the tunnel"
+        elif [ "$ROUTE_LAN" != 1 ]; then
+            echo "lan:        IPv4 uses the WAN (ROUTE_LAN=0)"
+        else
+            echo "lan:        IPv4 uses the WAN: the tunnel is not carrying traffic"
+        fi
         echo "rules:"
         ip rule list | grep -E "lookup ($TABLE|main) *$" | grep -vE '^32766' | sed 's/^/  /'
         echo "exit:       $(curl -4 -s --max-time 8 --interface "$IF" https://cloudflare.com/cdn-cgi/trace | grep -E '^(ip|colo|warp)=' | tr '\n' ' ')"
