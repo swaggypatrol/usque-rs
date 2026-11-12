@@ -25,9 +25,12 @@ size. The QUIC thread is then the busiest stage, at 11-13 us of CPU per packet.
 
 Forwarded traffic, which is what a LAN device actually gets, was measured from
 a Windows PC on the router's Wi-Fi, NATed into the tunnel, with merged segments
-enabled: 250-330 Mbit/s for a single download. Native IPv6 from the same PC,
-which bypasses the tunnel, reached 180-240 Mbit/s in the same minutes, so the
-5G line and not the router was the limit that evening. The table above is the
+enabled: 250-330 Mbit/s for a single download and 511 Mbit/s for six in
+parallel. Native IPv6 from the same PC, which bypasses the tunnel, reached
+180-250 Mbit/s for a single download in the same hours. While the six
+downloads ran, 77 of 78 pings sent through the tunnel were answered (94 ms on
+average, 207 ms at worst), which is what the service's fallback check relies
+on. The table above is the
 upper bound the router itself can carry. The same results held after an
 upgrade to firmware 388.13.
 
