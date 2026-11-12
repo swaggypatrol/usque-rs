@@ -1,0 +1,14 @@
+#!/bin/sh
+# Asuswrt-Merlin runs this before it carries out a service event
+# ($1 = start|stop|restart, $2 = what) and waits for it to return.
+#
+# Restarting the wireless interfaces or the network empties every ebtables
+# table. Take the WAN port out of the IPv6 bridge first, so the two networks
+# are never joined without the IPv6-only guard; service-event-end puts the
+# rules and the port back.
+case "$2" in
+    wireless* | net* | lan* | allnet)
+        [ -x /jffs/usque/ipv6-bridge.sh ] && /jffs/usque/ipv6-bridge.sh hold "$1 $2"
+        ;;
+esac
+exit 0

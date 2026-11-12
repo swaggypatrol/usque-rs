@@ -22,6 +22,8 @@ good native IPv6. The tunnel connects over IPv6 (`-6`) and carries only IPv4.
    ssh admin@router 'mkdir -p /jffs/usque /jffs/scripts'
    scp -O usque-rs usque.sh admin@router:/jffs/usque/
    scp -O services-start firewall-start nat-start admin@router:/jffs/scripts/
+   # only together with ipv6-bridge.sh (see the IPv6 section):
+   scp -O service-event service-event-end admin@router:/jffs/scripts/
    ssh admin@router 'chmod 755 /jffs/usque/usque-rs /jffs/usque/*.sh /jffs/scripts/*-start'
    ```
 
@@ -48,8 +50,15 @@ The service starts at boot through `services-start`.
   it if it exits.
 - **Routing.** Adds a default route through `warp0` in table 211 and rules that
   send traffic from the LAN subnet there, except to private and link-local
-  destinations. If usque-rs is not running the route is gone and LAN traffic
-  falls back to the WAN.
+  destinations.
+- **Fallback.** Every 5 s the service pings two public addresses through the
+  tunnel. The LAN rules are only in place while those pings are answered:
+  after boot, and whenever the tunnel stops carrying traffic, LAN IPv4 uses
+  the WAN directly instead of vanishing into a dead tunnel. Measured from a
+  LAN client: 18 s without IPv4 after the tunnel died, then direct; back in
+  the tunnel 6 s after it recovered. Each switch drops the connection table,
+  so open connections reset and reconnect rather than hang. `FALLBACK=0`
+  turns this off (LAN IPv4 then stops whenever the tunnel is down).
 - **No nested WARP.** Traffic from the LAN to Cloudflare's WARP ingress ranges
   also stays on the WAN. A LAN device running its own WARP client would
   otherwise build its tunnel inside this one, and Cloudflare then stops
@@ -59,7 +68,7 @@ The service starts at boot through `services-start`.
   to the tunnel MTU in both directions, and drops new connections arriving
   from the tunnel towards the router itself.
 - **Self-healing.** The firmware resets routing rules and firewall tables when
-  the WAN comes up or the firewall is rebuilt. Every 15 s the service checks
+  the WAN comes up or the firewall is rebuilt. Every 5 s the service checks
   for its entries and puts them back.
 - **Log.** Output goes to `/tmp/usque.log`, trimmed daily once it passes 512 KiB.
 
@@ -68,6 +77,7 @@ Optional settings go in `/jffs/usque/env`, one `NAME=value` per line:
 | Setting | Effect |
 |---|---|
 | `ROUTE_LAN=0` | Keep the tunnel up without routing the LAN into it. |
+| `FALLBACK=0` | Keep the LAN routed into the tunnel even while it is down. |
 | `USQUE_GRO=0` | Disable TCP segment merging on TUN writes. |
 | `USQUE_PIN=off` | Disable thread pinning. |
 
@@ -88,14 +98,27 @@ is still routed, NATed and sent through the tunnel by this router.
 
 Setup: set IPv6 to "Disable" in the router UI (the script then manages the
 router's own IPv6 on the bridge), copy `ipv6-bridge.sh` to `/jffs/usque/` and
-restart the service. `usque.sh` starts the bridge before the tunnel and
-re-checks it every 15 s; `ipv6-bridge.sh status` shows its state.
+`service-event` and `service-event-end` to `/jffs/scripts/`, and restart the
+service. `usque.sh` starts the bridge before the tunnel and re-checks it
+every 5 s; `ipv6-bridge.sh status` shows its state.
+
+The two `service-event` hooks are not optional. The firmware empties every
+ebtables table whenever it restarts the wireless interfaces or the network,
+which is also the moment every client reconnects and asks for DHCP. With the
+WAN port still in the bridge, the two networks would be joined at layer 2,
+IPv4 included, until the rules were put back: each network's DHCP server
+answers the other's clients. The firmware calls `service-event` before such a
+restart and waits for it, so the hook takes the WAN port out of the bridge
+first; `service-event-end` rebuilds the rules and only then plugs it back in.
+In a test with the rule state sampled every 0.4 s, the port was never in the
+bridge without the rules. If `guard rules missing` ever shows up in the system
+log, something emptied the tables by a path these hooks do not cover.
 
 What it sets up:
 
-- ebtables rules so that nothing but IPv6 can cross between WAN and LAN, and
-  so the WAN side cannot reach the router's own SSH, DNS or web ports over
-  IPv6.
+- ebtables rules (nat and broute tables) so that nothing but IPv6 can cross
+  between WAN and LAN, and so the WAN side cannot reach the router's own SSH,
+  DNS or web ports over IPv6.
 - The router's own IPv6 address and default route on the LAN bridge, from the
   gateway's router advertisements.
 - DNS interception (`DNS_INTERCEPT=1`, the default): the gateway advertises
@@ -116,7 +139,7 @@ Things to know:
 - Leave the router UI on "Disable" while the bridge is in use. The other
   modes start firmware helpers that work against it.
 - `ipv6-bridge.sh stop` removes the bridge and the rules and restores the
-  flow cache mode, but the service puts the bridge back within 15 s as long
+  flow cache mode, but the service puts the bridge back within seconds as long
   as the script is executable. To turn it off for good, follow the stop with
   `chmod -x /jffs/usque/ipv6-bridge.sh`, and only then pick another IPv6 mode
   in the UI.
@@ -143,6 +166,7 @@ empty). The script drops zero-lifetime RAs on the WAN interface;
 /jffs/usque/usque.sh stop
 rm -rf /jffs/usque
 rm /jffs/scripts/services-start /jffs/scripts/firewall-start /jffs/scripts/nat-start
+rm -f /jffs/scripts/service-event /jffs/scripts/service-event-end
 ```
 
 (Or remove only the usque lines if those scripts hold other commands.)
