@@ -3,7 +3,9 @@
 Scripts that run usque-rs as a service on an Asuswrt-Merlin router and send
 the whole LAN's IPv4 traffic through the tunnel, while IPv6 and the router's
 own traffic keep using the WAN directly. Written for and tested on an
-RT-AX86U (firmware 388.12); other Broadcom HND models should be close.
+RT-AX86U (firmware 388.12 and 388.13); other Broadcom HND models should be
+close. A walk-through of what the scripts do, in Chinese, is in
+`docs/GUIDE.zh-CN.md`.
 
 Typical use: the WAN has slow IPv4 (for example behind carrier-grade NAT) but
 good native IPv6. The tunnel connects over IPv6 (`-6`) and carries only IPv4.
@@ -12,7 +14,9 @@ good native IPv6. The tunnel connects over IPv6 (`-6`) and carries only IPv4.
 
 1. In the router UI, under Administration > System, enable SSH and
    "JFFS custom scripts and configs".
-2. Build or download an `aarch64-unknown-linux-musl` binary and copy the files:
+2. Build an `aarch64-unknown-linux-musl` binary
+   (`cargo zigbuild --release --target aarch64-unknown-linux-musl`) and copy
+   the files:
 
    ```sh
    ssh admin@router 'mkdir -p /jffs/usque /jffs/scripts'

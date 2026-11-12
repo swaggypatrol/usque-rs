@@ -1,7 +1,8 @@
 # Data path and performance notes
 
-This branch reworks the tunnel data path so that a small router can carry a
+This fork reworks the tunnel data path so that a small router can carry a
 fast line. The protocol side (registration, handshake, CONNECT-IP) is unchanged.
+A guided tour of the code, in Chinese, is in `docs/GUIDE.zh-CN.md`.
 
 ## Results
 
@@ -15,17 +16,20 @@ and bound to the tunnel address.
 |---|---|---|---|
 | usque (Go) 4.2.1, `nativetun` | 54 Mbit/s (4 flows) | 50-69 Mbit/s | not measured |
 | usque-rs 0.1.0 | 140-200 Mbit/s (4 flows) | 130-155 Mbit/s | not measured |
-| this branch | 590-650 Mbit/s | 410-435 Mbit/s | 78-138 Mbit/s |
+| this fork | 590-650 Mbit/s | 410-435 Mbit/s | 78-138 Mbit/s |
 | official client on a desktop PC, same line, same hours | - | 330-435 Mbit/s | 19-64 Mbit/s |
 
 In steady state the router receives about 77,000 tunnelled packets per second
 (roughly 750 Mbit/s); a gigabit WAN port tops out near 87,000 packets of this
 size. The QUIC thread is then the busiest stage, at 11-13 us of CPU per packet.
 
-Forwarding for a LAN client (a Windows PC on the router's Wi-Fi, NATed into
-the tunnel) has been checked for correctness with merged segments enabled, but
-its throughput has not been measured yet: treat the numbers above as an upper
-bound for forwarded traffic.
+Forwarded traffic, which is what a LAN device actually gets, was measured from
+a Windows PC on the router's Wi-Fi, NATed into the tunnel, with merged segments
+enabled: 250-330 Mbit/s for a single download. Native IPv6 from the same PC,
+which bypasses the tunnel, reached 180-240 Mbit/s in the same minutes, so the
+5G line and not the router was the limit that evening. The table above is the
+upper bound the router itself can carry. The same results held after an
+upgrade to firmware 388.13.
 
 ## What changed
 

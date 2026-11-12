@@ -3,9 +3,15 @@
 > **This fork** reworks the data path for small multi-core routers: a threaded
 > pipeline with batched UDP I/O, TCP segment merging on TUN writes, BBR2, and a
 > keepalive with dead-peer detection. On an RT-AX86U it went from about
-> 150 Mbit/s to about 600 Mbit/s. See [PERFORMANCE.md](PERFORMANCE.md) for the
-> measurements and [contrib/asuswrt-merlin](contrib/asuswrt-merlin) for a
-> ready-made router service.
+> 150 Mbit/s to about 600 Mbit/s.
+>
+> | Read this | For |
+> |---|---|
+> | [docs/GUIDE.zh-CN.md](docs/GUIDE.zh-CN.md) | 中文导读：协议、代码地图、一个包的旅程、路由器脚本、踩过的坑、怎么编译和做实验 |
+> | [PERFORMANCE.md](PERFORMANCE.md) | Design decisions and measurements |
+> | [contrib/asuswrt-merlin](contrib/asuswrt-merlin) | A ready-made service for Asuswrt-Merlin routers: LAN-wide IPv4 through the tunnel, plus native IPv6 when the upstream gateway delegates no prefix |
+>
+> Everything below is the upstream README.
 
 A tiny Rust rewrite of my previous [usque](https://github.com/Diniboy1123/usque) project. The goal is simple: a decently fast, native tunnel using Cloudflare WARP and its MASQUE-based protocol.
 
