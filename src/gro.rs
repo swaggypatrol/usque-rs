@@ -102,6 +102,9 @@ fn parse(pkt: &[u8]) -> Option<Seg> {
     if u16::from_be_bytes([pkt[6], pkt[7]]) != 0x4000 {
         return None;
     }
+    if fold(sum_bytes(&pkt[..IPV4_HLEN], 0)) != 0xffff {
+        return None;
+    }
     let tcp = &pkt[IPV4_HLEN..];
     let thl = usize::from(tcp[12] >> 4) * 4;
     if thl < 20 || tcp.len() <= thl || tcp[12] & 0x0f != 0 {
@@ -127,7 +130,16 @@ fn parse(pkt: &[u8]) -> Option<Seg> {
 
 /// True if both packets belong to the same TCP flow.
 fn same_flow(a: &[u8], b: &[u8]) -> bool {
-    a[12..24] == b[12..24]
+    // Flow recognition includes IP options, even though merging excludes them.
+    if b.len() < IPV4_HLEN || b[0] >> 4 != 4 || b[9] != 6 {
+        return false;
+    }
+    let ihl = usize::from(b[0] & 0x0f) * 4;
+    ihl >= IPV4_HLEN
+        && b.len() >= ihl + 4
+        && u16::from_be_bytes([b[6], b[7]]) & 0x1fff == 0
+        && a[12..20] == b[12..20]
+        && a[20..24] == b[ihl..ihl + 4]
 }
 
 /// True if `pkt` may follow `head` in a merged packet (same flow assumed):
@@ -149,6 +161,10 @@ fn headers_match(head: &[u8], pkt: &[u8], thl: usize) -> bool {
 pub struct Gro {
     open: Vec<Group>,
     ops: Vec<Op>,
+}
+
+impl Default for Gro {
+    fn default() -> Self { Self::new() }
 }
 
 impl Gro {
@@ -176,13 +192,8 @@ impl Gro {
         self.ops.clear();
         for i in 0..n.min(MAX_SEGS) {
             let p = pkt(i);
-            let slot = if p.len() >= IPV4_HLEN + 20 && p[0] == 0x45 {
-                self.open
-                    .iter()
-                    .position(|g| same_flow(pkt(usize::from(g.members[0])), p))
-            } else {
-                None
-            };
+            let slot = self.open.iter()
+                .position(|g| same_flow(pkt(usize::from(g.members[0])), p));
             let seg = parse(p);
 
             // Try to extend the flow's open group.
@@ -599,6 +610,34 @@ mod tests {
             }
         }
         let ops = plan(&pkts);
+        assert_roundtrip(&pkts, &ops);
+    }
+
+    #[test]
+    fn corrupt_ipv4_header_is_never_merged() {
+        let mut f = Flow::new(80);
+        let p0 = f.seg(1228, TCP_FLAG_ACK);
+        let mut p1 = f.seg(1228, TCP_FLAG_ACK);
+        p1[10] ^= 1;
+        let pkts = vec![p0, p1];
+        assert_eq!(shape(&plan(&pkts)), vec![vec![0], vec![1]]);
+    }
+
+    #[test]
+    fn ip_options_flush_the_same_flow_in_order() {
+        let mut f = Flow::new(80);
+        let p0 = f.seg(1228, TCP_FLAG_ACK);
+        let mut p1 = f.seg(1228, TCP_FLAG_ACK);
+        p1.splice(20..20, [1, 1, 1, 1]);
+        p1[0] = 0x46;
+        let len = p1.len() as u16;
+        p1[2..4].copy_from_slice(&len.to_be_bytes());
+        p1[10..12].fill(0);
+        let c = !fold(sum_bytes(&p1[..24], 0));
+        p1[10..12].copy_from_slice(&c.to_be_bytes());
+        let pkts = vec![p0, p1, f.seg(1228, TCP_FLAG_ACK)];
+        let ops = plan(&pkts);
+        assert_eq!(shape(&ops), vec![vec![0], vec![1], vec![2]]);
         assert_roundtrip(&pkts, &ops);
     }
 }

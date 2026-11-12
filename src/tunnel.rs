@@ -24,9 +24,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
-use crate::gro::{self, Gro, VNET_HDR_LEN};
-use crate::icmp;
-use crate::packet;
+use usque_rs::gro::{self, Gro, VNET_HDR_LEN};
+use usque_rs::icmp;
+use usque_rs::datagram::parse_datagram;
+use usque_rs::packet;
 use crate::tls;
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
@@ -757,7 +758,7 @@ pub fn maintain_tunnel(
     }
 
     let tun = Tun {
-        fd: tun_dev.fd,
+        fd: tun_dev.as_raw_fd(),
         vnet: tun_dev.vnet_hdr,
         gro: tun_dev.vnet_hdr && std::env::var("USQUE_GRO").map_or(true, |v| v != "0"),
     };
@@ -1496,28 +1497,6 @@ fn forward(
     }
 }
 
-/// Parse an H3 datagram: `varint(flow_id)` + `varint(context_id)` + IP packet
-/// Returns the IP payload slice if `flow_id` matches and `context_id` == 0.
-fn parse_datagram(dgram: &[u8], expected_flow_id: u64) -> Option<&[u8]> {
-    let mut b = octets::Octets::with_slice(dgram);
-
-    let fid = b.get_varint().ok()?;
-    if fid != expected_flow_id {
-        return None;
-    }
-
-    let ctx_id = b.get_varint().ok()?;
-    if ctx_id != 0 {
-        return None;
-    }
-
-    let off = b.off();
-    if off >= dgram.len() {
-        return None;
-    }
-
-    Some(&dgram[off..])
-}
 
 #[cfg(test)]
 mod tests {

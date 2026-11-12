@@ -21,12 +21,10 @@ pub fn compose_icmp_too_large(original: &[u8], mtu: u16) -> Option<Vec<u8>> {
 }
 
 fn compose_icmpv4_too_large(original: &[u8], mtu: u16) -> Option<Vec<u8>> {
-    if original.len() < IPV4_HEADER_LEN {
-        return None;
-    }
+    let ihl = crate::packet::ipv4_header_len(original).ok()?;
 
     // ICMP payload: original IP header + first 8 bytes of original payload
-    let icmp_payload_len = (IPV4_HEADER_LEN + 8).min(original.len());
+    let icmp_payload_len = (ihl + 8).min(original.len());
     let icmp_data = &original[..icmp_payload_len];
 
     let total_len = IPV4_HEADER_LEN + ICMP_HEADER_LEN + icmp_data.len();

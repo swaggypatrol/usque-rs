@@ -26,9 +26,6 @@
 //! usque-rs - MASQUE (CONNECT-IP) client for Cloudflare WARP.
 
 mod config;
-mod gro;
-mod icmp;
-mod packet;
 mod register;
 mod tls;
 mod tun_device;

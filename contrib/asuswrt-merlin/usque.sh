@@ -98,22 +98,54 @@ rule_flush() {
     done
 }
 
+# Compare selectors, not just priority: another owned rule can survive a
+# partial firmware reset while the LAN rule or one exclusion is missing.
+rule_has() {
+    ip rule list | awk -v prio="$1:" -v src="$2" -v dst="$3" -v table="$4" '
+        function norm(s) { sub("/32$", "", s); return s }
+        $1 == prio {
+            from = "all"; to = "all"; lookup = ""
+            for (i = 2; i < NF; i++) {
+                if ($i == "from") from = $(i + 1)
+                if ($i == "to") to = $(i + 1)
+                if ($i == "lookup") lookup = $(i + 1)
+            }
+            if (norm(from) == norm(src) && norm(to) == norm(dst) && lookup == table) found = 1
+        }
+        END { exit !found }
+    '
+}
+
+rule_ensure() {
+    if ! rule_has "$1" "$2" "$3" "$4"; then
+        ip rule add from "$2" to "$3" lookup "$4" prio "$1" || return 1
+        ROUTE_CHANGED=1
+    fi
+}
+
 route_up() {
     have_if || return 1
-    ip route replace default dev "$IF" table "$TABLE"
-    rule_flush
-    # Connections bound to the tunnel address (e.g. `curl --interface`) use the tunnel.
+    ROUTE_CHANGED=0
+    if ! ip route show table "$TABLE" 2>/dev/null | awk -v dev="$IF" '
+        $1 == "default" { for (i = 2; i < NF; i++) if ($i == "dev" && $(i + 1) == dev) found = 1 }
+        END { exit !found }
+    '; then
+        ip route replace default dev "$IF" table "$TABLE" || return 1
+        ROUTE_CHANGED=1
+    fi
     a=$(tun_ip)
-    [ -n "$a" ] && ip rule add from "$a" lookup "$TABLE" prio $((PRIO - 20))
+    [ -z "$a" ] || rule_ensure $((PRIO - 20)) "$a" all "$TABLE" || return 1
     net=$(lan_net)
     if [ "$ROUTE_LAN" = 1 ] && [ -n "$net" ]; then
-        # Private and link-local destinations, and the WARP ingress, stay on the main table.
         for d in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 100.64.0.0/10 224.0.0.0/4 $WARP_INGRESS; do
-            ip rule add from "$net" to "$d" lookup main prio $((PRIO - 10))
+            rule_ensure $((PRIO - 10)) "$net" "$d" main || return 1
         done
-        ip rule add from "$net" lookup "$TABLE" prio "$PRIO"
+        rule_ensure "$PRIO" "$net" all "$TABLE" || return 1
     fi
-    ip route flush cache
+    if [ "$ROUTE_CHANGED" = 1 ]; then
+        ip route flush cache
+        logger -t usque "routing rules restored"
+    fi
 }
 
 route_down() {
@@ -139,15 +171,9 @@ ensure() {
     # Optional companion: native IPv6 for the LAN by bridging it to the WAN.
     [ -x "$DIR/ipv6-bridge.sh" ] && "$DIR/ipv6-bridge.sh" ensure
     have_if || return 0
-    if ! ip route show table "$TABLE" 2>/dev/null | grep -q '^default' ||
-        ! ip rule list | grep -q "^$((PRIO - 20)):"; then
-        route_up
-        logger -t usque "routing rules restored"
-    fi
-    if ! iptables -t nat -C POSTROUTING -o "$IF" -j MASQUERADE 2>/dev/null; then
-        fw_up
-        logger -t usque "firewall rules restored"
-    fi
+    route_up
+    # Check every owned NAT, MSS and INPUT rule, even if NAT survived.
+    fw_up
 }
 
 run() {

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 pub struct TunConfig {
     pub name: Option<String>,
@@ -12,19 +12,19 @@ pub struct TunConfig {
 
 /// An open TUN device (layer 3, no packet-information header).
 pub struct TunDev {
-    pub fd: RawFd,
+    fd: OwnedFd,
     pub name: String,
     /// Every packet read from or written to `fd` is prefixed by a
     /// `virtio_net_hdr`, which lets writes carry merged TCP segments.
     pub vnet_hdr: bool,
 }
 
-const TUNSETIFF: libc::c_ulong = 0x4004_54ca;
+const TUNSETIFF: libc::c_ulong = libc::TUNSETIFF as libc::c_ulong;
 const IFF_TUN: libc::c_short = 0x0001;
 const IFF_NO_PI: libc::c_short = 0x1000;
 const IFF_VNET_HDR: libc::c_short = 0x4000;
 
-fn open_tun_node() -> Result<RawFd> {
+fn open_tun_node() -> Result<OwnedFd> {
     const PATH: &[u8] = b"/dev/net/tun\0";
     let open = || {
         // SAFETY: PATH is a valid NUL-terminated string.
@@ -48,7 +48,12 @@ fn open_tun_node() -> Result<RawFd> {
         return Err(std::io::Error::last_os_error())
             .context("failed to open /dev/net/tun (is the tun kernel module loaded?)");
     }
-    Ok(fd)
+    // SAFETY: open returned a fresh descriptor owned exclusively here.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+impl AsRawFd for TunDev {
+    fn as_raw_fd(&self) -> RawFd { self.fd.as_raw_fd() }
 }
 
 fn attach(fd: RawFd, name: &str, flags: libc::c_short) -> std::io::Result<String> {
@@ -72,16 +77,15 @@ pub fn create_tun(cfg: &TunConfig) -> Result<TunDev> {
     let fd = open_tun_node()?;
     let mut vnet_hdr = want_vnet;
     let mut res = attach(
-        fd,
+        fd.as_raw_fd(),
         want,
         IFF_TUN | IFF_NO_PI | if want_vnet { IFF_VNET_HDR } else { 0 },
     );
     if res.is_err() && want_vnet {
-        // SAFETY: fd is a valid descriptor we own.
-        unsafe { libc::close(fd) };
+        drop(fd);
         let fd2 = open_tun_node()?;
         vnet_hdr = false;
-        res = attach(fd2, want, IFF_TUN | IFF_NO_PI);
+        res = attach(fd2.as_raw_fd(), want, IFF_TUN | IFF_NO_PI);
         let name = res.context("failed to create TUN device")?;
         log::info!("TUN device created: {name} (no vnet_hdr support)");
         return Ok(TunDev {
