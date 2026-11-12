@@ -136,6 +136,8 @@ alive() { [ -f "$1" ] && kill -0 "$(cat "$1")" 2>/dev/null; }
 
 # Re-apply routing and firewall entries that have gone missing.
 ensure() {
+    # Optional companion: native IPv6 for the LAN by bridging it to the WAN.
+    [ -x "$DIR/ipv6-bridge.sh" ] && "$DIR/ipv6-bridge.sh" ensure
     have_if || return 0
     if ! ip route show table "$TABLE" 2>/dev/null | grep -q '^default' ||
         ! ip rule list | grep -q "^$((PRIO - 20)):"; then
@@ -154,6 +156,8 @@ run() {
     while :; do
         tune
         rotate
+        # The tunnel connects over IPv6, so bring that up first if we manage it.
+        [ -x "$DIR/ipv6-bridge.sh" ] && "$DIR/ipv6-bridge.sh" start
         "$DIR/usque-rs" -c "$DIR/config.json" nativetun -6 -s "$SNI" -n "$IF" -S -m "$MTU" >> "$LOG" 2>&1 &
         echo $! > "$CHILD"
         i=0

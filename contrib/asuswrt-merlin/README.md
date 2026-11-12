@@ -16,13 +16,14 @@ good native IPv6. The tunnel connects over IPv6 (`-6`) and carries only IPv4.
 
    ```sh
    ssh admin@router 'mkdir -p /jffs/usque /jffs/scripts'
-   scp -O usque-rs usque.sh ipv6-ra-filter.sh admin@router:/jffs/usque/
+   scp -O usque-rs usque.sh admin@router:/jffs/usque/
    scp -O services-start firewall-start nat-start admin@router:/jffs/scripts/
    ssh admin@router 'chmod 755 /jffs/usque/usque-rs /jffs/usque/*.sh /jffs/scripts/*-start'
    ```
 
    If you already have `services-start`, `firewall-start` or `nat-start`,
-   append the lines from these files instead of replacing yours.
+   append the lines from these files instead of replacing yours. The two
+   `ipv6-*.sh` scripts are optional; see the IPv6 section below.
 3. Register on the router (add `--jwt <token>` for Zero Trust):
 
    ```sh
@@ -68,11 +69,55 @@ Optional settings go in `/jffs/usque/env`, one `NAME=value` per line:
 
 Other `USQUE_*` variables are listed in `PERFORMANCE.md`.
 
-## IPv6 Passthrough and vanishing default routes
+## Native IPv6 for the LAN when there is no delegated prefix
 
-`ipv6-ra-filter.sh` is only for routers that use the firmware's "IPv6
-Passthrough" mode, which is the way to give LAN clients native IPv6 when the
-upstream gateway hands out a single /64 and no delegated prefix.
+The firmware's "Native" IPv6 mode needs the upstream gateway to delegate a
+prefix (DHCPv6-PD). Some gateways, cellular ones in particular, hand out a
+single /64 and nothing else. Two optional scripts cover that case; use one.
+
+### `ipv6-bridge.sh` (recommended)
+
+Bridges IPv6, and only IPv6, between the WAN port and the LAN bridge. LAN
+devices get their addresses, default route and IPv6 firewalling straight from
+the upstream gateway, as if they were plugged into it. IPv4 is untouched: it
+is still routed, NATed and sent through the tunnel by this router.
+
+Setup: set IPv6 to "Disable" in the router UI (the script then manages the
+router's own IPv6 on the bridge), copy `ipv6-bridge.sh` to `/jffs/usque/` and
+restart the service. `usque.sh` starts the bridge before the tunnel and
+re-checks it every 15 s; `ipv6-bridge.sh status` shows its state.
+
+What it sets up:
+
+- ebtables rules so that nothing but IPv6 can cross between WAN and LAN, and
+  so the WAN side cannot reach the router's own SSH, DNS or web ports over
+  IPv6.
+- The router's own IPv6 address and default route on the LAN bridge, from the
+  gateway's router advertisements.
+- DNS interception (`DNS_INTERCEPT=1`, the default): the gateway advertises
+  itself as an IPv6 DNS server, so LAN devices would bypass the router's
+  resolver. DNS over IPv6 from the LAN, to any server, is answered by this
+  router instead. Set `DNS_INTERCEPT=0` in `/jffs/usque/env` to turn it off.
+- The Broadcom flow cache in "L3" mode. In the default "L2 & L3" mode it
+  forwards frames between two known MAC addresses in hardware without showing
+  them to ebtables, so only a device's first packets would be filtered or
+  redirected. Throughput is the same in both modes.
+
+Things to know:
+
+- A LAN device running its own WARP client may copy the gateway's link-local
+  DNS server onto its tunnel adapter, where it is unreachable, and then every
+  lookup waits for a timeout. Behind this router the client is redundant
+  anyway; turn it off.
+- `ipv6-bridge.sh stop` removes the bridge and the rules and restores the
+  flow cache mode.
+
+### Firmware "IPv6 Passthrough" with `ipv6-ra-filter.sh`
+
+The alternative keeps the firmware in charge. It works for devices that stay
+on the LAN, but a device that moves between the gateway's own network and the
+router's keeps its addresses, and the gateway keeps sending to where it last
+saw them.
 
 In that mode the firmware relays every Router Advertisement it hears on the
 WAN to the LAN and rewrites the source to its own address. Thread border

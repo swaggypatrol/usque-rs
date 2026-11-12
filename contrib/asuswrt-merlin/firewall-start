@@ -1,4 +1,6 @@
 #!/bin/sh
 # Asuswrt-Merlin runs this whenever it has rebuilt the filter rules.
 [ -x /jffs/usque/usque.sh ] && /jffs/usque/usque.sh fw
+# Pick the one that matches your IPv6 setup (see README.md); neither is required.
+[ -x /jffs/usque/ipv6-bridge.sh ] && /jffs/usque/ipv6-bridge.sh ensure
 [ -x /jffs/usque/ipv6-ra-filter.sh ] && /jffs/usque/ipv6-ra-filter.sh
