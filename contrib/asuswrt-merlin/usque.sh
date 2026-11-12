@@ -24,6 +24,12 @@ SNI=zt-masque.cloudflareclient.com
 LOG=/tmp/usque.log
 PID=/var/run/usque-supervisor.pid
 CHILD=/var/run/usque.pid
+# Cloudflare's WARP ingress ranges (consumer, WireGuard, MASQUE, MASQUE over
+# HTTP/2). A WARP client on the LAN must reach these outside our tunnel:
+# running one WARP tunnel inside another makes Cloudflare stop forwarding for
+# the outer one. Cloudflare documents the same exclusion for its own WAN
+# on-ramps ("double encapsulation").
+WARP_INGRESS="162.159.192.0/24 162.159.193.0/24 162.159.197.0/24 162.159.198.0/24"
 
 ROUTE_LAN=1
 RUST_LOG=info
@@ -101,8 +107,8 @@ route_up() {
     [ -n "$a" ] && ip rule add from "$a" lookup "$TABLE" prio $((PRIO - 20))
     net=$(lan_net)
     if [ "$ROUTE_LAN" = 1 ] && [ -n "$net" ]; then
-        # Private and link-local destinations stay on the main table.
-        for d in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 100.64.0.0/10 224.0.0.0/4; do
+        # Private and link-local destinations, and the WARP ingress, stay on the main table.
+        for d in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 100.64.0.0/10 224.0.0.0/4 $WARP_INGRESS; do
             ip rule add from "$net" to "$d" lookup main prio $((PRIO - 10))
         done
         ip rule add from "$net" lookup "$TABLE" prio "$PRIO"

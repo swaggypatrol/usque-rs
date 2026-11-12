@@ -45,6 +45,11 @@ The service starts at boot through `services-start`.
   send traffic from the LAN subnet there, except to private and link-local
   destinations. If usque-rs is not running the route is gone and LAN traffic
   falls back to the WAN.
+- **No nested WARP.** Traffic from the LAN to Cloudflare's WARP ingress ranges
+  also stays on the WAN. A LAN device running its own WARP client would
+  otherwise build its tunnel inside this one, and Cloudflare then stops
+  forwarding the outer tunnel. Cloudflare recommends the same exclusion for
+  its own on-ramps ("double encapsulation").
 - **Firewall.** Masquerades traffic leaving through `warp0`, clamps the TCP MSS
   to the tunnel MTU in both directions, and drops new connections arriving
   from the tunnel towards the router itself.

@@ -22,10 +22,10 @@ In steady state the router receives about 77,000 tunnelled packets per second
 (roughly 750 Mbit/s); a gigabit WAN port tops out near 87,000 packets of this
 size. The QUIC thread is then the busiest stage, at 11-13 us of CPU per packet.
 
-What has not been measured: throughput for LAN clients, where the kernel
-forwards and NATs the packets instead of terminating TCP locally. The merged
-segments described below take the kernel's ordinary forwarding path, but treat
-the numbers above as an upper bound until that has been tested.
+Forwarding for a LAN client (a Windows PC on the router's Wi-Fi, NATed into
+the tunnel) has been checked for correctness with merged segments enabled, but
+its throughput has not been measured yet: treat the numbers above as an upper
+bound for forwarded traffic.
 
 ## What changed
 
@@ -95,6 +95,13 @@ BBR2 reached 78-138 Mbit/s with 15-25 ms of added latency under load. BBR
   the tunnel is idle, and the QUIC idle timeout is set to two periods plus 5 s.
   A dead peer or a changed path therefore ends the session, and the next
   packet from the TUN device opens a new one.
+- The proxy can stop forwarding a tunnel while it keeps acknowledging at the
+  QUIC level, which neither the idle timeout nor the keepalive notices. This
+  was seen when a WARP client on the LAN ran its own tunnel inside this one:
+  pings went out, 44-byte acknowledgements came back, and nothing else. The
+  session now ends when the proxy closes or resets the CONNECT-IP stream, sends
+  GOAWAY, or when 32 or more packets have gone out and nothing has come back
+  for 12 s; the next packet from the TUN device opens a new session.
 - A session that fails within 2 s is followed by a 1 s pause, so an unreachable
   endpoint does not turn into a busy loop.
 - The one-line live statistics are printed only when stderr is a terminal.

@@ -54,6 +54,12 @@ const DGRAM_SEND_QUEUE_LEN: usize = 1024;
 /// moving on lossy or jittery links, where CUBIC stalled at a fraction of the
 /// available rate. Override with `USQUE_CC=reno|cubic|bbr|bbr2`.
 const DEFAULT_CC: &str = "bbr2";
+/// The tunnel is considered dead when this many packets have gone out since
+/// the last packet came back and that took at least `NO_RETURN_TIMEOUT`. The
+/// proxy can stop forwarding while it keeps acknowledging at the QUIC level,
+/// which neither the idle timeout nor the keepalive notices.
+const NO_RETURN_PACKETS: u64 = 32;
+const NO_RETURN_TIMEOUT: Duration = Duration::from_secs(12);
 /// A session that ends sooner than this is followed by a pause before retrying.
 const MIN_SESSION: Duration = Duration::from_secs(2);
 /// Max `recvmmsg` rounds before ACKs are flushed.
@@ -987,7 +993,7 @@ fn drain_dgrams(
     cur: &mut [Batch],
     stats: &Stats,
     mut diag: Option<&mut SeqDiag>,
-) {
+) -> u64 {
     let mut pkts = 0u64;
     let mut bytes = 0u64;
     let writers = cur.len();
@@ -1037,16 +1043,17 @@ fn drain_dgrams(
         stats.rx_packets.fetch_add(pkts, Ordering::Relaxed);
         stats.rx_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
+    pkts
 }
 
-/// Queue one batch of TUN packets as QUIC datagrams.
+/// Queue one batch of TUN packets as QUIC datagrams. Returns how many were queued.
 fn send_up_batch(
     conn: &mut quiche::Connection,
     flow_prefix: &[u8],
     io: &Io,
     b: &mut Batch,
     stats: &Stats,
-) {
+) -> u64 {
     let mut pkts = 0u64;
     let mut bytes = 0u64;
     let mut dropped = 0u64;
@@ -1079,6 +1086,7 @@ fn send_up_batch(
     if dropped > 0 {
         stats.dropped.fetch_add(dropped, Ordering::Relaxed);
     }
+    pkts
 }
 
 fn run_tunnel_session(
@@ -1278,7 +1286,7 @@ fn run_tunnel_session(
         &mut h3_conn,
         io,
         first,
-        flow_id,
+        stream_id,
         udp_fd,
         recv_info,
         tunnel_cfg.keepalive_period,
@@ -1288,6 +1296,11 @@ fn run_tunnel_session(
     );
 
     stats.stop.store(true, Ordering::Relaxed);
+    if !conn.is_closed() {
+        // We are abandoning a connection the peer still considers open.
+        conn.close(true, 0x100, b"").ok();
+        flush(&mut conn, &mut tx, udp_fd).ok();
+    }
     result
 }
 
@@ -1298,7 +1311,7 @@ fn forward(
     h3_conn: &mut quiche::h3::Connection,
     io: &Io,
     first: Batch,
-    flow_id: u64,
+    stream_id: u64,
     udp_fd: RawFd,
     recv_info: quiche::RecvInfo,
     keepalive_interval: Duration,
@@ -1306,6 +1319,7 @@ fn forward(
     tx: &mut Mmsg,
     stats: &Stats,
 ) -> Result<()> {
+    let flow_id = stream_id / 4;
     // Build the flow_id varint prefix + context_id zero
     let mut flow_prefix = Vec::with_capacity(HEADROOM);
     {
@@ -1324,6 +1338,10 @@ fn forward(
     let mut seq_diag = std::env::var_os("USQUE_SEQDIAG").map(|_| SeqDiag::new());
     let mut last_io = Instant::now();
     let mut iterations = 0u32;
+    // Packets sent since the last one came back, and when the first of them left.
+    let mut unanswered = 0u64;
+    let mut unanswered_since = Instant::now();
+    let mut capsule = [0u8; 512];
 
     loop {
         if conn.timeout().is_some_and(|t| t.is_zero()) {
@@ -1340,8 +1358,8 @@ fn forward(
                 }
             }
             received += n;
-            if n > 0 {
-                drain_dgrams(conn, flow_id, io, &mut down, stats, seq_diag.as_mut());
+            if n > 0 && drain_dgrams(conn, flow_id, io, &mut down, stats, seq_diag.as_mut()) > 0 {
+                unanswered = 0;
             }
             if n < BATCH_PKTS {
                 break;
@@ -1354,16 +1372,34 @@ fn forward(
             }
         }
 
-        // Process H3 events (capsules, etc.)
+        // Events on the CONNECT-IP request stream. The proxy can end the
+        // tunnel there while the QUIC connection stays up; when it does,
+        // datagrams are still acknowledged but no longer forwarded.
         if received > 0 {
             loop {
                 match h3_conn.poll(conn) {
+                    Ok((sid, quiche::h3::Event::Data)) => {
+                        // Capsules (address and route updates). Read them so the
+                        // stream's flow control keeps moving; we do not act on them.
+                        while let Ok(n) = h3_conn.recv_body(conn, sid, &mut capsule) {
+                            log::info!(
+                                "capsule data on stream {sid}: {n} bytes: {}",
+                                hex::encode(&capsule[..n.min(64)])
+                            );
+                        }
+                    }
+                    Ok((sid, quiche::h3::Event::Finished)) if sid == stream_id => {
+                        bail!("the proxy closed the CONNECT-IP stream");
+                    }
+                    Ok((sid, quiche::h3::Event::Reset(code))) if sid == stream_id => {
+                        bail!("the proxy reset the CONNECT-IP stream (error {code:#x})");
+                    }
+                    Ok((_, quiche::h3::Event::GoAway)) => {
+                        bail!("the proxy sent GOAWAY");
+                    }
                     Ok(_) => {}
                     Err(quiche::h3::Error::Done) => break,
-                    Err(e) => {
-                        log::warn!("h3 poll error: {e}");
-                        break;
-                    }
+                    Err(e) => bail!("HTTP/3 error: {e}"),
                 }
             }
         }
@@ -1376,7 +1412,13 @@ fn forward(
                 break;
             };
             up_pkts += b.pkts.len();
-            send_up_batch(conn, &flow_prefix, io, &mut b, stats);
+            let queued = send_up_batch(conn, &flow_prefix, io, &mut b, stats);
+            if queued > 0 {
+                if unanswered == 0 {
+                    unanswered_since = Instant::now();
+                }
+                unanswered += queued;
+            }
             let _ = io.up_ret.send(b);
             up_batches += 1;
         }
@@ -1389,6 +1431,12 @@ fn forward(
 
         if conn.is_closed() {
             return Ok(());
+        }
+        if unanswered >= NO_RETURN_PACKETS && unanswered_since.elapsed() >= NO_RETURN_TIMEOUT {
+            bail!(
+                "{unanswered} packets sent and nothing received for {} s; restarting the tunnel",
+                unanswered_since.elapsed().as_secs()
+            );
         }
 
         iterations = iterations.wrapping_add(1);
