@@ -1,0 +1,3 @@
+#!/bin/sh
+# Asuswrt-Merlin runs this once services are up after boot.
+[ -x /jffs/usque/usque.sh ] && /jffs/usque/usque.sh start

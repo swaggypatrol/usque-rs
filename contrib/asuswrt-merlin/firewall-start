@@ -1,0 +1,4 @@
+#!/bin/sh
+# Asuswrt-Merlin runs this whenever it has rebuilt the filter rules.
+[ -x /jffs/usque/usque.sh ] && /jffs/usque/usque.sh fw
+[ -x /jffs/usque/ipv6-ra-filter.sh ] && /jffs/usque/ipv6-ra-filter.sh

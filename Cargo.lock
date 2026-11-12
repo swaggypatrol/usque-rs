@@ -180,9 +180,9 @@ dependencies = [
 
 [[package]]
 name = "blocking"
-version = "1.6.2"
+version = "1.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e83f8d02be6967315521be875afa792a316e28d57b5a2d401897e2a7921b7f21"
+checksum = "a70e4329df6cb94385eed412ec92375c3cdd8a6e502493d1229b6414e4036dfa"
 dependencies = [
  "async-channel",
  "async-task",
@@ -208,26 +208,6 @@ name = "bytes"
 version = "1.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
-
-[[package]]
-name = "c2rust-bitfields"
-version = "0.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dcee50917f9de1a018e3f4f9a8f2ff3d030a288cffa4b18d9b391e97c12e4cfb"
-dependencies = [
- "c2rust-bitfields-derive",
-]
-
-[[package]]
-name = "c2rust-bitfields-derive"
-version = "0.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b457277798202ccd365b9c112ebee08ddd57f1033916c8b8ea52f222e5b715d"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
 
 [[package]]
 name = "cc"
@@ -352,9 +332,9 @@ dependencies = [
 
 [[package]]
 name = "crossbeam-utils"
-version = "0.8.21"
+version = "0.8.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
+checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
 
 [[package]]
 name = "crypto-bigint"
@@ -522,11 +502,10 @@ dependencies = [
 
 [[package]]
 name = "event-listener"
-version = "5.4.1"
+version = "5.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e13b66accf52311f30a0db42147dadea9850cb48cd070028831ae5f5d4b856ab"
+checksum = "5a23add41df1562121a9393cb065eab5146a1242410f23a644851e90cfd669d2"
 dependencies = [
- "concurrent-queue",
  "parking",
  "pin-project-lite",
 ]
@@ -2180,19 +2159,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tokio-util"
-version = "0.7.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9ae9cec805b01e8fc3fd2fe289f89149a9b66dd16786abd8b19cfa7b48cb0098"
-dependencies = [
- "bytes",
- "futures-core",
- "futures-sink",
- "pin-project-lite",
- "tokio",
-]
-
-[[package]]
 name = "tower"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2270,15 +2236,11 @@ checksum = "7904c94104239657089d14bccbf23fd6d363e30639ce49af21ef008a445baf97"
 dependencies = [
  "bytes",
  "cfg-if",
- "futures",
- "futures-core",
  "ipnet",
  "libc",
  "log",
  "nix 0.30.1",
  "thiserror 2.0.18",
- "tokio",
- "tokio-util",
  "windows-sys 0.59.0",
  "wintun-bindings",
 ]
@@ -2331,6 +2293,7 @@ dependencies = [
  "env_logger",
  "futures",
  "hex",
+ "libc",
  "log",
  "mio",
  "netlink-packet-route 0.21.0",
@@ -2776,29 +2739,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6bbff5f0aada427a1e5a6da5f1f98158182f26556f345ac9e04d36d0ebed650"
 
 [[package]]
-name = "winreg"
-version = "0.55.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb5a765337c50e9ec252c2069be9bf91c7df47afb103b642ba3a53bf8101be97"
-dependencies = [
- "cfg-if",
- "windows-sys 0.59.0",
-]
-
-[[package]]
 name = "wintun-bindings"
-version = "0.7.34"
+version = "0.7.39"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "27ae04d34b8569174e849128d2e36538329a27daa79c06ed0375f2c5d6704461"
+checksum = "fc4494d02357537af05cf526be7b817a51752b688a78926af57379abd840d911"
 dependencies = [
  "blocking",
- "c2rust-bitfields",
  "futures",
  "libloading",
  "log",
  "thiserror 2.0.18",
  "windows-sys 0.61.2",
- "winreg",
 ]
 
 [[package]]

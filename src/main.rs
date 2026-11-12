@@ -26,6 +26,7 @@
 //! usque-rs - MASQUE (CONNECT-IP) client for Cloudflare WARP.
 
 mod config;
+mod gro;
 mod icmp;
 mod packet;
 mod register;
@@ -228,5 +229,5 @@ async fn cmd_nativetun(
         mtu,
     };
 
-    tunnel::maintain_tunnel(&cfg, &tunnel_cfg, tun_dev).await
+    tokio::task::block_in_place(|| tunnel::maintain_tunnel(&cfg, &tunnel_cfg, &tun_dev))
 }

@@ -1,5 +1,12 @@
 # usque-rs
 
+> **This fork** reworks the data path for small multi-core routers: a threaded
+> pipeline with batched UDP I/O, TCP segment merging on TUN writes, BBR2, and a
+> keepalive with dead-peer detection. On an RT-AX86U it went from about
+> 150 Mbit/s to about 600 Mbit/s. See [PERFORMANCE.md](PERFORMANCE.md) for the
+> measurements and [contrib/asuswrt-merlin](contrib/asuswrt-merlin) for a
+> ready-made router service.
+
 A tiny Rust rewrite of my previous [usque](https://github.com/Diniboy1123/usque) project. The goal is simple: a decently fast, native tunnel using Cloudflare WARP and its MASQUE-based protocol.
 
 This is just the `nativetun` implementation from the [Go version](https://github.com/Diniboy1123/usque/blob/main/README.md#native-tunnel-mode-for-advanced-users-linux-and-windows-only) and it's **Linux-only**. If you need proxy support or other platforms, this isn't for you. Check the docs over there to understand the project better.

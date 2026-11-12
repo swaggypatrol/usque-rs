@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 quiche = { version = "0.22", features = ["boringssl-vendored"] }
 octets = "0.3"
+libc = "0.2"
 
 tokio = { version = "1", features = ["io-util", "net", "macros", "rt-multi-thread", "time"] }
 mio = { version = "1", features = ["net", "os-poll"] }
@@ -35,7 +36,6 @@ p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }
 sec1 = { version = "0.7", features = ["pkcs8", "der", "pem"] }
 der = { version = "0.7", features = ["pem"] }
 pkcs8 = { version = "0.10", features = ["pem", "std"] }
-tun = { version = "0.7", features = ["async"] }
 rtnetlink = "0.14"
 netlink-packet-route = "0.21"
 futures = "0.3"
@@ -43,6 +43,10 @@ tempfile = "3"
 time = "0.3"
 # Software fallback for 64-bit atomics on targets without native support (e.g. armv5te)
 portable-atomic = { version = "1", features = ["fallback"] }
+
+[dev-dependencies]
+# Used by the root-only integration tests to create TUN devices.
+tun = "0.7"
 
 [profile.release]
 opt-level = 3

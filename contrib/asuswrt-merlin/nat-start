@@ -1,0 +1,3 @@
+#!/bin/sh
+# Asuswrt-Merlin runs this whenever it has rebuilt the NAT rules.
+[ -x /jffs/usque/usque.sh ] && /jffs/usque/usque.sh fw
