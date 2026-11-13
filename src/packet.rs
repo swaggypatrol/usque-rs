@@ -11,6 +11,8 @@ pub enum PacketError {
     UnknownVersion(u8),
     #[error("packet too short for IPv{version} header (got {len} bytes)")]
     TooShort { version: u8, len: usize },
+    #[error("invalid IPv4 header length: {0}")]
+    InvalidHeaderLength(u8),
     #[error("TTL/hop limit too small: {0}")]
     TtlExpired(u8),
 }
@@ -29,18 +31,13 @@ pub fn prepare_outgoing(buf: &mut [u8]) -> Result<u8, PacketError> {
 
     match ip_version(buf) {
         4 => {
-            if buf.len() < IPV4_HEADER_LEN {
-                return Err(PacketError::TooShort {
-                    version: 4,
-                    len: buf.len(),
-                });
-            }
+            let ihl = ipv4_header_len(buf)?;
             let ttl = buf[8];
             if ttl <= 1 {
                 return Err(PacketError::TtlExpired(ttl));
             }
             buf[8] -= 1;
-            let checksum = calculate_ipv4_checksum(&buf[..IPV4_HEADER_LEN]);
+            let checksum = calculate_ipv4_checksum(&buf[..ihl]);
             buf[10..12].copy_from_slice(&checksum.to_be_bytes());
             Ok(4)
         }
@@ -60,6 +57,28 @@ pub fn prepare_outgoing(buf: &mut [u8]) -> Result<u8, PacketError> {
         }
         v => Err(PacketError::UnknownVersion(v)),
     }
+}
+
+/// Validate and return the complete IPv4 header length, including options.
+pub fn ipv4_header_len(buf: &[u8]) -> Result<usize, PacketError> {
+    if buf.len() < IPV4_HEADER_LEN {
+        return Err(PacketError::TooShort {
+            version: 4,
+            len: buf.len(),
+        });
+    }
+    let words = buf[0] & 0x0f;
+    if words < 5 {
+        return Err(PacketError::InvalidHeaderLength(words));
+    }
+    let len = usize::from(words) * 4;
+    if buf.len() < len {
+        return Err(PacketError::TooShort {
+            version: 4,
+            len: buf.len(),
+        });
+    }
+    Ok(len)
 }
 
 /// Validate an incoming IP packet (basic checks only).
@@ -353,6 +372,35 @@ mod tests {
                 sum = (sum & 0xFFFF) + (sum >> 16);
             }
             assert_eq!(sum as u16, 0xFFFF, "checksum invalid at ttl={expected_ttl}");
+        }
+    }
+
+    #[test]
+    fn options_checksum_survives_ttl_decrement() {
+        for words in 5..=15u8 {
+            let ihl = usize::from(words) * 4;
+            let mut p = make_ipv4(ihl + 8);
+            p[0] = 0x40 | words;
+            p[20..ihl].fill(1);
+            let before = calculate_ipv4_checksum(&p[..ihl]);
+            p[10..12].copy_from_slice(&before.to_be_bytes());
+            prepare_outgoing(&mut p).unwrap();
+            assert_eq!(p[8], 63);
+            assert_eq!(
+                u16::from_be_bytes([p[10], p[11]]),
+                calculate_ipv4_checksum(&p[..ihl])
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_ihl_is_rejected_without_modifying_packet() {
+        for (ihl, len) in [(4, 20), (6, 20), (15, 59)] {
+            let mut p = make_ipv4(len);
+            p[0] = 0x40 | ihl;
+            let original = p.clone();
+            assert!(prepare_outgoing(&mut p).is_err());
+            assert_eq!(p, original);
         }
     }
 }

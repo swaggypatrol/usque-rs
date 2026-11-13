@@ -87,8 +87,9 @@ untune() {
 }
 
 # --- firewall ----------------------------------------------------------------
-ipt_add() { t=$1; c=$2; shift 2; iptables -t "$t" -C "$c" "$@" 2>/dev/null || iptables -t "$t" -A "$c" "$@"; }
-ipt_ins() { t=$1; c=$2; shift 2; iptables -t "$t" -C "$c" "$@" 2>/dev/null || iptables -t "$t" -I "$c" 1 "$@"; }
+# Each adds its rule only if it is missing, and notes in FW_CHANGED that it had to.
+ipt_add() { t=$1; c=$2; shift 2; iptables -t "$t" -C "$c" "$@" 2>/dev/null || { iptables -t "$t" -A "$c" "$@"; FW_CHANGED=1; }; }
+ipt_ins() { t=$1; c=$2; shift 2; iptables -t "$t" -C "$c" "$@" 2>/dev/null || { iptables -t "$t" -I "$c" 1 "$@"; FW_CHANGED=1; }; }
 ipt_del() { t=$1; c=$2; shift 2; while iptables -t "$t" -D "$c" "$@" 2>/dev/null; do :; done; }
 
 fw_rules() { # fw_rules <ipt_add|ipt_del> <ipt_ins|ipt_del>
@@ -105,6 +106,11 @@ fw_down() { fw_rules ipt_del ipt_del; }
 # --- routing -----------------------------------------------------------------
 rule_del() { for p in "$@"; do while ip rule del prio "$p" 2>/dev/null; do :; done; done; }
 lan_routed() { ip rule list | grep -q "^$PRIO:"; }
+# The rules at the given priorities, one per line with single spaces, as
+# `ip rule list` words them: "9000: from 192.168.50.0/24 lookup 211".
+rules_at() {
+    ip rule list | awk -v a="$1:" -v b="${2:-$1}:" '$1 == a || $1 == b { $1 = $1; print }'
+}
 
 # The tunnel's own table, and a rule for connections bound to the tunnel
 # address (`curl --interface`, the probe below). Present whenever the
@@ -118,6 +124,13 @@ route_base() {
     ip route flush cache
 }
 
+# True if the table still has its route and the tunnel address has exactly its one rule.
+route_ok() {
+    ip route show table "$TABLE" 2>/dev/null | grep -q "^default dev $IF" || return 1
+    a=$(tun_ip)
+    [ -z "$a" ] || [ "$(rules_at $((PRIO - 20)))" = "$((PRIO - 20)): from $a lookup $TABLE" ]
+}
+
 # Connections set up along the other path cannot continue on this one. Forget
 # them, in the kernel and in the hardware flow cache, so that they fail at
 # once and are opened again instead of hanging.
@@ -127,16 +140,31 @@ flow_reset() {
     ip route flush cache
 }
 
+# The rules that send the LAN ($1) into the tunnel, worded as rules_at prints them.
+# Private and link-local destinations, and the WARP ingress, stay on the main table.
+lan_rules() {
+    for d in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 100.64.0.0/10 224.0.0.0/4 $WARP_INGRESS; do
+        echo "$((PRIO - 10)): from $1 to $d lookup main"
+    done
+    echo "$PRIO: from $1 lookup $TABLE"
+}
+
+# True if exactly those rules are in place: none missing, none left over.
+lan_ok() {
+    net=$(lan_net)
+    [ -n "$net" ] || return 0
+    [ "$(lan_rules "$net" | sort)" = "$(rules_at $((PRIO - 10)) "$PRIO" | sort)" ]
+}
+
 # Send the LAN's IPv4 into the tunnel.
 lan_on() {
     net=$(lan_net)
     [ "$ROUTE_LAN" = 1 ] && [ -n "$net" ] || return 0
     rule_del $((PRIO - 10)) "$PRIO"
-    # Private and link-local destinations, and the WARP ingress, stay on the main table.
-    for d in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 100.64.0.0/10 224.0.0.0/4 $WARP_INGRESS; do
-        ip rule add from "$net" to "$d" lookup main prio $((PRIO - 10))
+    lan_rules "$net" | while read -r prio rule; do
+        # shellcheck disable=SC2086  # the rule is a list of words
+        ip rule add $rule prio "${prio%:}"
     done
-    ip rule add from "$net" lookup "$TABLE" prio "$PRIO"
     flow_reset
 }
 
@@ -177,23 +205,28 @@ alive() { [ -f "$1" ] && kill -0 "$(cat "$1")" 2>/dev/null; }
 
 # Re-apply routing and firewall entries that have gone missing.
 # $1 is where the LAN should be going right now: on (tunnel) or off (WAN).
+#
+# Every entry is checked, not one that stands for the rest: the firmware can
+# drop a single rule or one firewall table and leave the others.
 ensure() {
     # Optional companion: native IPv6 for the LAN by bridging it to the WAN.
     [ -x "$DIR/ipv6-bridge.sh" ] && "$DIR/ipv6-bridge.sh" ensure
     have_if || return 0
-    if ! ip route show table "$TABLE" 2>/dev/null | grep -q '^default' ||
-        ! ip rule list | grep -q "^$((PRIO - 20)):"; then
+    fixed=
+    if ! route_ok; then
         route_base
-        logger -t usque "routing rules restored"
+        fixed="$fixed tunnel-route"
     fi
-    if [ "$1" = on ] && [ "$ROUTE_LAN" = 1 ] && ! lan_routed; then
+    # While LAN rules were missing, connections went out the wrong way;
+    # lan_on rebuilds the whole set and resets those connections.
+    if [ "$1" = on ] && [ "$ROUTE_LAN" = 1 ] && ! lan_ok; then
         lan_on
-        logger -t usque "LAN routing rules restored"
+        fixed="$fixed lan-rules"
     fi
-    if ! iptables -t nat -C POSTROUTING -o "$IF" -j MASQUERADE 2>/dev/null; then
-        fw_up
-        logger -t usque "firewall rules restored"
-    fi
+    FW_CHANGED=
+    fw_up
+    [ -z "$FW_CHANGED" ] || fixed="$fixed firewall"
+    [ -z "$fixed" ] || logger -t usque "restored:$fixed"
 }
 
 # Watch the tunnel while usque-rs runs, and point the LAN at it only while it

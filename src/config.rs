@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 
 use crate::register::AccountData;
@@ -28,12 +29,26 @@ impl Config {
 
     pub fn save(&self, path: &str) -> Result<()> {
         let json = serde_json::to_string_pretty(self)?;
-        if let Some(parent) = Path::new(path).parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)?;
-            }
+        let parent = Path::new(path)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)?;
+        // The file holds the device's private key. Write a private temporary
+        // file (created with mode 0600) next to it and rename it into place, so
+        // a crash never leaves half a config and the result is never readable
+        // by others, whatever the mode of the file it replaces.
+        let mut temp = tempfile::NamedTempFile::new_in(parent)
+            .with_context(|| format!("failed to create a temporary file for {path}"))?;
+        temp.write_all(json.as_bytes())?;
+        temp.as_file().sync_all()?;
+        temp.persist(path)
+            .with_context(|| format!("failed to replace config at {path}"))?;
+        // Best effort: make the rename itself durable.
+        if let Ok(dir) = fs::File::open(parent) {
+            let _ = dir.sync_all();
         }
-        fs::write(path, json).with_context(|| format!("failed to write config to {path}"))
+        Ok(())
     }
 
     pub fn from_account_data(account: &AccountData, token: &str, priv_key_der: &[u8]) -> Self {
@@ -69,5 +84,51 @@ impl Config {
         let pem = pem::parse(&self.endpoint_pub_key)
             .with_context(|| "failed to parse endpoint public key PEM")?;
         Ok(pem.contents().to_vec())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn example() -> Config {
+        Config {
+            private_key: "test-only".into(),
+            endpoint_v4: "192.0.2.1".into(),
+            endpoint_v6: "2001:db8::1".into(),
+            endpoint_pub_key: String::new(),
+            license: String::new(),
+            id: "test-device".into(),
+            access_token: "test-token".into(),
+            ipv4: "100.96.0.2".into(),
+            ipv6: "fd00::2".into(),
+        }
+    }
+
+    #[test]
+    fn save_replaces_an_existing_config_and_leaves_no_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        fs::write(&path, "old contents").unwrap();
+        let cfg = example();
+        cfg.save(path.to_str().unwrap()).unwrap();
+        let loaded = Config::load(path.to_str().unwrap()).unwrap();
+        assert_eq!(loaded.id, cfg.id);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_restricts_permissions_even_when_replacing_a_public_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        fs::write(&path, "old contents").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        example().save(path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 }

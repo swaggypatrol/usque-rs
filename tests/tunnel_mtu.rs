@@ -2,6 +2,10 @@
 //!
 //! **Requires root or CAP_NET_ADMIN** - tests are skipped otherwise.
 
+// The crate-wide pedantic lints are for the client itself; these tests keep
+// the plain defaults they were written under.
+#![allow(clippy::pedantic, clippy::nursery)]
+
 use std::io::Write;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 
@@ -92,17 +96,29 @@ fn try_create_tun(name: &str, mtu: u16) -> Option<tun::Device> {
     let mut dev = match tun::create(&config) {
         Ok(d) => d,
         Err(e) => {
+            assert!(
+                std::env::var_os("USQUE_REQUIRE_TUN").is_none(),
+                "required TUN unavailable: {e}"
+            );
             eprintln!("Skipping TUN test (no permission): {e}");
             return None;
         }
     };
 
     if let Err(e) = dev.set_mtu(mtu) {
+        assert!(
+            std::env::var_os("USQUE_REQUIRE_TUN").is_none(),
+            "required MTU setup failed: {e}"
+        );
         eprintln!("Failed to set MTU: {e}");
         return None;
     }
 
     if let Err(e) = dev.enabled(true) {
+        assert!(
+            std::env::var_os("USQUE_REQUIRE_TUN").is_none(),
+            "required link setup failed: {e}"
+        );
         eprintln!("Failed to bring device UP: {e}");
         return None;
     }
@@ -195,6 +211,11 @@ fn tun_device_jumbo_mtu_ipv6_write() {
 
 mod pipeline {
     use super::*;
+    use usque_rs::{
+        datagram::parse_datagram,
+        icmp::compose_icmp_too_large,
+        packet::{prepare_outgoing, validate_incoming},
+    };
 
     fn encode_varint(val: u64) -> Vec<u8> {
         let mut tmp = [0u8; 8];
@@ -202,67 +223,6 @@ mod pipeline {
         b.put_varint(val).unwrap();
         let len = b.off();
         tmp[..len].to_vec()
-    }
-
-    fn prepare_outgoing(buf: &mut [u8]) -> Result<u8, String> {
-        if buf.is_empty() {
-            return Err("empty".into());
-        }
-        match buf[0] >> 4 {
-            4 => {
-                if buf.len() < IPV4_HEADER_LEN {
-                    return Err("too short".into());
-                }
-                let ttl = buf[8];
-                if ttl <= 1 {
-                    return Err("ttl expired".into());
-                }
-                buf[8] -= 1;
-                let cksum = ipv4_checksum(&buf[..IPV4_HEADER_LEN]);
-                buf[10..12].copy_from_slice(&cksum.to_be_bytes());
-                Ok(4)
-            }
-            6 => {
-                if buf.len() < IPV6_HEADER_LEN {
-                    return Err("too short".into());
-                }
-                if buf[7] <= 1 {
-                    return Err("hop limit expired".into());
-                }
-                buf[7] -= 1;
-                Ok(6)
-            }
-            v => Err(format!("unknown version: {v}")),
-        }
-    }
-
-    fn validate_incoming(buf: &[u8]) -> Result<u8, String> {
-        if buf.is_empty() {
-            return Err("empty".into());
-        }
-        match buf[0] >> 4 {
-            4 if buf.len() >= IPV4_HEADER_LEN => Ok(4),
-            6 if buf.len() >= IPV6_HEADER_LEN => Ok(6),
-            4 | 6 => Err("too short".into()),
-            v => Err(format!("unknown version: {v}")),
-        }
-    }
-
-    fn parse_datagram(dgram: &[u8], expected_flow_id: u64) -> Option<Vec<u8>> {
-        let mut b = octets::Octets::with_slice(dgram);
-        let fid = b.get_varint().ok()?;
-        if fid != expected_flow_id {
-            return None;
-        }
-        let ctx = b.get_varint().ok()?;
-        if ctx != 0 {
-            return None;
-        }
-        let off = b.off();
-        if off >= dgram.len() {
-            return None;
-        }
-        Some(dgram[off..].to_vec())
     }
 
     struct TestResult {
@@ -316,7 +276,7 @@ mod pipeline {
         assert_eq!(r.ttl_after, 63);
         let payload = parse_datagram(&r.datagram, 0).expect("should parse");
         assert_eq!(payload.len(), 576);
-        assert_eq!(validate_incoming(&payload).unwrap(), 4);
+        assert_eq!(validate_incoming(payload).unwrap(), 4);
         assert!(verify_ipv4_checksum(&payload[..IPV4_HEADER_LEN]));
     }
 
@@ -386,7 +346,7 @@ mod pipeline {
     fn round_trip_ipv4_small() {
         let r = pipeline_ipv4(100, 42);
         let payload = parse_datagram(&r.datagram, 42).expect("should parse");
-        assert_eq!(validate_incoming(&payload).unwrap(), 4);
+        assert_eq!(validate_incoming(payload).unwrap(), 4);
         assert_eq!(payload[8], 63);
     }
 
@@ -394,14 +354,14 @@ mod pipeline {
     fn round_trip_ipv4_large() {
         let r = pipeline_ipv4(4000, 42);
         let payload = parse_datagram(&r.datagram, 42).expect("should parse");
-        assert_eq!(validate_incoming(&payload).unwrap(), 4);
+        assert_eq!(validate_incoming(payload).unwrap(), 4);
     }
 
     #[test]
     fn round_trip_ipv6_small() {
         let r = pipeline_ipv6(100, 7);
         let payload = parse_datagram(&r.datagram, 7).expect("should parse");
-        assert_eq!(validate_incoming(&payload).unwrap(), 6);
+        assert_eq!(validate_incoming(payload).unwrap(), 6);
         assert_eq!(payload[7], 63);
     }
 
@@ -409,7 +369,7 @@ mod pipeline {
     fn round_trip_ipv6_large() {
         let r = pipeline_ipv6(5000, 7);
         let payload = parse_datagram(&r.datagram, 7).expect("should parse");
-        assert_eq!(validate_incoming(&payload).unwrap(), 6);
+        assert_eq!(validate_incoming(payload).unwrap(), 6);
     }
 
     #[test]
@@ -489,115 +449,5 @@ mod pipeline {
         let icmp_hdr = &resp[IPV6_HEADER_LEN..];
         let mtu = u32::from_be_bytes([icmp_hdr[4], icmp_hdr[5], icmp_hdr[6], icmp_hdr[7]]);
         assert_eq!(mtu, 1280);
-    }
-
-    // Helper that re-implements compose_icmp_too_large so the test file
-    // is standalone (integration tests can't access private crate items).
-    fn compose_icmp_too_large(original: &[u8], mtu: u16) -> Option<Vec<u8>> {
-        if original.is_empty() {
-            return None;
-        }
-        match original[0] >> 4 {
-            4 => compose_icmpv4_too_large(original, mtu),
-            6 => compose_icmpv6_too_large(original, mtu),
-            _ => None,
-        }
-    }
-
-    fn compose_icmpv4_too_large(original: &[u8], mtu: u16) -> Option<Vec<u8>> {
-        if original.len() < IPV4_HEADER_LEN {
-            return None;
-        }
-        let icmp_payload_len = (IPV4_HEADER_LEN + 8).min(original.len());
-        let icmp_data = &original[..icmp_payload_len];
-        let total_len = IPV4_HEADER_LEN + 8 + icmp_data.len();
-        let mut pkt = vec![0u8; total_len];
-        pkt[0] = 0x45;
-        pkt[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
-        pkt[8] = 64;
-        pkt[9] = 1;
-        pkt[12..16].copy_from_slice(&original[16..20]);
-        pkt[16..20].copy_from_slice(&original[12..16]);
-        let ip_cksum = ipv4_checksum(&pkt[..IPV4_HEADER_LEN]);
-        pkt[10..12].copy_from_slice(&ip_cksum.to_be_bytes());
-        let icmp_start = IPV4_HEADER_LEN;
-        pkt[icmp_start] = 3;
-        pkt[icmp_start + 1] = 4;
-        pkt[icmp_start + 6..icmp_start + 8].copy_from_slice(&mtu.to_be_bytes());
-        pkt[icmp_start + 8..].copy_from_slice(icmp_data);
-        let icmp_cksum = internet_checksum(&pkt[icmp_start..]);
-        pkt[icmp_start + 2..icmp_start + 4].copy_from_slice(&icmp_cksum.to_be_bytes());
-        Some(pkt)
-    }
-
-    fn compose_icmpv6_too_large(original: &[u8], mtu: u16) -> Option<Vec<u8>> {
-        if original.len() < IPV6_HEADER_LEN {
-            return None;
-        }
-        let max_icmp_payload = 1232;
-        let icmp_payload_len = original.len().min(max_icmp_payload);
-        let icmp_data = &original[..icmp_payload_len];
-        let payload_len = 8 + icmp_data.len();
-        let total_len = IPV6_HEADER_LEN + payload_len;
-        let mut pkt = vec![0u8; total_len];
-        pkt[0] = 0x60;
-        pkt[4..6].copy_from_slice(&(payload_len as u16).to_be_bytes());
-        pkt[6] = 58;
-        pkt[7] = 64;
-        pkt[8..24].copy_from_slice(&original[24..40]);
-        pkt[24..40].copy_from_slice(&original[8..24]);
-        let icmp_start = IPV6_HEADER_LEN;
-        pkt[icmp_start] = 2;
-        pkt[icmp_start + 1] = 0;
-        pkt[icmp_start + 4..icmp_start + 8].copy_from_slice(&(mtu as u32).to_be_bytes());
-        pkt[icmp_start + 8..].copy_from_slice(icmp_data);
-        // ICMPv6 checksum with pseudo-header
-        let mut sum: u32 = 0;
-        for i in (0..16).step_by(2) {
-            sum += u16::from_be_bytes([pkt[8 + i], pkt[8 + i + 1]]) as u32;
-            sum += u16::from_be_bytes([pkt[24 + i], pkt[24 + i + 1]]) as u32;
-        }
-        let plen = pkt[icmp_start..].len() as u32;
-        sum += plen >> 16;
-        sum += plen & 0xFFFF;
-        sum += 58u32;
-        let mut j = 0;
-        while j < pkt[icmp_start..].len() {
-            if j == 2 {
-                j += 2;
-                continue;
-            }
-            let w = if j + 1 < pkt[icmp_start..].len() {
-                u16::from_be_bytes([pkt[icmp_start + j], pkt[icmp_start + j + 1]])
-            } else {
-                u16::from_be_bytes([pkt[icmp_start + j], 0])
-            };
-            sum += w as u32;
-            j += 2;
-        }
-        while sum >> 16 != 0 {
-            sum = (sum & 0xFFFF) + (sum >> 16);
-        }
-        let cksum = !(sum as u16);
-        pkt[icmp_start + 2..icmp_start + 4].copy_from_slice(&cksum.to_be_bytes());
-        Some(pkt)
-    }
-
-    fn internet_checksum(data: &[u8]) -> u16 {
-        let mut sum: u32 = 0;
-        let mut i = 0;
-        while i < data.len() {
-            let word = if i + 1 < data.len() {
-                u16::from_be_bytes([data[i], data[i + 1]])
-            } else {
-                u16::from_be_bytes([data[i], 0])
-            };
-            sum += word as u32;
-            i += 2;
-        }
-        while sum >> 16 != 0 {
-            sum = (sum & 0xFFFF) + (sum >> 16);
-        }
-        !(sum as u16)
     }
 }

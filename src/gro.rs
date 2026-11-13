@@ -102,6 +102,9 @@ fn parse(pkt: &[u8]) -> Option<Seg> {
     if u16::from_be_bytes([pkt[6], pkt[7]]) != 0x4000 {
         return None;
     }
+    if fold(sum_bytes(&pkt[..IPV4_HLEN], 0)) != 0xffff {
+        return None;
+    }
     let tcp = &pkt[IPV4_HLEN..];
     let thl = usize::from(tcp[12] >> 4) * 4;
     if thl < 20 || tcp.len() <= thl || tcp[12] & 0x0f != 0 {
@@ -125,9 +128,23 @@ fn parse(pkt: &[u8]) -> Option<Seg> {
     })
 }
 
-/// True if both packets belong to the same TCP flow.
-fn same_flow(a: &[u8], b: &[u8]) -> bool {
-    a[12..24] == b[12..24]
+/// True if `pkt` could belong to the TCP flow of `head`, the first packet of an
+/// open group. This decides ordering, not merging: a packet of the flow that
+/// cannot be merged must still be written after the group, so anything that
+/// might be part of the flow counts. That includes packets with IP options
+/// (ports sit further in) and later fragments (no ports at all).
+fn same_flow(head: &[u8], pkt: &[u8]) -> bool {
+    if pkt.len() < IPV4_HLEN || pkt[0] >> 4 != 4 || pkt[9] != 6 || head[12..20] != pkt[12..20] {
+        return false;
+    }
+    let ihl = usize::from(pkt[0] & 0x0f) * 4;
+    // The fragment offset is the low 13 bits; shift the three flag bits out.
+    let later_fragment = u16::from_be_bytes([pkt[6], pkt[7]]) << 3 != 0;
+    if later_fragment || ihl < IPV4_HLEN || pkt.len() < ihl + 4 {
+        // No ports to compare: same hosts, same protocol is all we know.
+        return true;
+    }
+    head[IPV4_HLEN..IPV4_HLEN + 4] == pkt[ihl..ihl + 4]
 }
 
 /// True if `pkt` may follow `head` in a merged packet (same flow assumed):
@@ -149,6 +166,12 @@ fn headers_match(head: &[u8], pkt: &[u8], thl: usize) -> bool {
 pub struct Gro {
     open: Vec<Group>,
     ops: Vec<Op>,
+}
+
+impl Default for Gro {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Gro {
@@ -176,13 +199,10 @@ impl Gro {
         self.ops.clear();
         for i in 0..n.min(MAX_SEGS) {
             let p = pkt(i);
-            let slot = if p.len() >= IPV4_HLEN + 20 && p[0] == 0x45 {
-                self.open
-                    .iter()
-                    .position(|g| same_flow(pkt(usize::from(g.members[0])), p))
-            } else {
-                None
-            };
+            let slot = self
+                .open
+                .iter()
+                .position(|g| same_flow(pkt(usize::from(g.members[0])), p));
             let seg = parse(p);
 
             // Try to extend the flow's open group.
@@ -208,8 +228,14 @@ impl Gro {
                 }
             }
 
-            // Not mergeable with the open group: flush it to keep the flow in order.
-            if let Some(s) = slot {
+            // Not mergeable: flush every open group this packet could belong
+            // to, so the flow stays in order. (A later fragment can match
+            // several groups between the same two hosts.)
+            while let Some(s) = self
+                .open
+                .iter()
+                .position(|g| same_flow(pkt(usize::from(g.members[0])), p))
+            {
                 let g = self.open.remove(s);
                 Self::emit(&mut self.ops, g);
             }
@@ -241,9 +267,10 @@ impl Gro {
     }
 }
 
-/// Fill `out` with the virtio header followed by the IP + TCP header of the
-/// merged packet for `g`. Returns the number of bytes used; the caller appends
-/// the first member's payload and then every other member's payload.
+/// Fill `out` with the virtio header and the IP + TCP header of the merged packet for `g`.
+///
+/// Returns the number of bytes used; the caller appends the first member's
+/// payload and then every other member's payload.
 pub fn merged_header<'a>(
     g: &Group,
     pkt: impl Fn(usize) -> &'a [u8],
@@ -600,5 +627,80 @@ mod tests {
         }
         let ops = plan(&pkts);
         assert_roundtrip(&pkts, &ops);
+    }
+
+    #[test]
+    fn corrupt_ipv4_header_is_never_merged() {
+        let mut f = Flow::new(80);
+        let p0 = f.seg(1228, TCP_FLAG_ACK);
+        let mut p1 = f.seg(1228, TCP_FLAG_ACK);
+        p1[10] ^= 1;
+        let pkts = vec![p0, p1];
+        assert_eq!(shape(&plan(&pkts)), vec![vec![0], vec![1]]);
+    }
+
+    #[test]
+    fn ip_options_flush_the_same_flow_in_order() {
+        let mut f = Flow::new(80);
+        let p0 = f.seg(1228, TCP_FLAG_ACK);
+        let mut p1 = f.seg(1228, TCP_FLAG_ACK);
+        p1.splice(20..20, [1, 1, 1, 1]);
+        p1[0] = 0x46;
+        let len = p1.len() as u16;
+        p1[2..4].copy_from_slice(&len.to_be_bytes());
+        p1[10..12].fill(0);
+        let c = !fold(sum_bytes(&p1[..24], 0));
+        p1[10..12].copy_from_slice(&c.to_be_bytes());
+        let pkts = vec![p0, p1, f.seg(1228, TCP_FLAG_ACK)];
+        let ops = plan(&pkts);
+        assert_eq!(shape(&ops), vec![vec![0], vec![1], vec![2]]);
+        assert_roundtrip(&pkts, &ops);
+    }
+
+    /// A fragment that is not the first of its packet: no TCP header, so no ports.
+    fn later_fragment(f: &Flow) -> Vec<u8> {
+        let mut p = vec![0u8; 20 + 64];
+        let total = p.len() as u16;
+        p[0] = 0x45;
+        p[2..4].copy_from_slice(&total.to_be_bytes());
+        p[6..8].copy_from_slice(&185u16.to_be_bytes());
+        p[8] = 57;
+        p[9] = 6;
+        p[12..16].copy_from_slice(&f.src);
+        p[16..20].copy_from_slice(&f.dst);
+        let c = !fold(sum_bytes(&p[..20], 0));
+        p[10..12].copy_from_slice(&c.to_be_bytes());
+        p
+    }
+
+    #[test]
+    fn later_fragment_flushes_every_flow_between_the_same_hosts() {
+        let mut a = Flow::new(80);
+        let mut b = Flow::new(81);
+        let pkts = vec![
+            a.seg(1228, TCP_FLAG_ACK),
+            b.seg(1228, TCP_FLAG_ACK),
+            a.seg(1228, TCP_FLAG_ACK),
+            b.seg(1228, TCP_FLAG_ACK),
+            later_fragment(&a),
+            a.seg(1228, TCP_FLAG_ACK),
+        ];
+        // The fragment could belong to either flow, so both groups go out first.
+        let ops = plan(&pkts);
+        assert_eq!(shape(&ops), vec![vec![0, 2], vec![1, 3], vec![4], vec![5]]);
+        assert_roundtrip(&pkts, &ops);
+    }
+
+    #[test]
+    fn packets_between_other_hosts_leave_a_group_alone() {
+        let mut a = Flow::new(80);
+        let mut other = Flow::new(80);
+        other.src = [9, 9, 9, 9];
+        let pkts = vec![
+            a.seg(1228, TCP_FLAG_ACK),
+            later_fragment(&other),
+            a.seg(1228, TCP_FLAG_ACK),
+        ];
+        assert_eq!(shape(&plan(&pkts)), vec![vec![1], vec![0, 2]]);
     }
 }

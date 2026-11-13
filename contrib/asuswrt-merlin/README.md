@@ -68,8 +68,10 @@ The service starts at boot through `services-start`.
   to the tunnel MTU in both directions, and drops new connections arriving
   from the tunnel towards the router itself.
 - **Self-healing.** The firmware resets routing rules and firewall tables when
-  the WAN comes up or the firewall is rebuilt. Every 5 s the service checks
-  for its entries and puts them back.
+  the WAN comes up or the firewall is rebuilt, sometimes only some of them.
+  Every 5 s the service compares each of its routing rules and firewall rules
+  with what is installed and rebuilds what is missing or left over; the
+  system log then gets a line such as `usque: restored: lan-rules firewall`.
 - **Log.** Output goes to `/tmp/usque.log`, trimmed daily once it passes 512 KiB.
 
 Optional settings go in `/jffs/usque/env`, one `NAME=value` per line:
